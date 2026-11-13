@@ -1,0 +1,51 @@
+[package]
+name = "gust"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight Go IDE for the AI coding era"
+
+[dependencies]
+gpui-kit = { version = "0.9.1", features = [
+    "tree-sitter-go",
+    "tree-sitter-yaml",
+    "tree-sitter-toml",
+    "tree-sitter-markdown",
+    "tree-sitter-sql",
+    "tree-sitter-proto",
+    "tree-sitter-bash",
+    "tree-sitter-make",
+    "tree-sitter-diff",
+] }
+alacritty_terminal = "0.26"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-channel = "2"
+chrono = "0.4"
+ignore = "0.4"
+memory-stats = "1"
+notify = "8"
+lsp-types = "0.97"
+markdown = "1"
+similar = "2.7"
+tree-sitter = "0.26"
+tree-sitter-go = "0.23"
+
+[build-dependencies]
+embed-resource = "3"
+
+[dev-dependencies]
+gpui-kit = { version = "0.9.1", features = ["test-support"] }
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
