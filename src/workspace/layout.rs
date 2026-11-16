@@ -301,6 +301,18 @@ impl Workspace {
             SidebarTab::Files => h_flex()
                 .gap_0p5()
                 .child(
+                    Self::header_button("tree-new-file", "file-plus", "新建文件", cx).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            let dir = this.new_file_dir(cx);
+                            this.open_file_prompt(
+                                super::file_ops::FileAction::New { dir, folder: false },
+                                window,
+                                cx,
+                            )
+                        }),
+                    ),
+                )
+                .child(
                     Self::header_button("tree-locate", "locate-fixed", "定位当前文件", cx).on_click(
                         cx.listener(|this, _, _, cx| {
                             if let Some(path) =
@@ -399,11 +411,26 @@ impl Workspace {
             .map(|tab| self.render_diff(tab, cx));
         let body = match self.active.and_then(|ix| self.docs.get(ix)) {
             _ if diff.is_some() => diff.unwrap(),
-            Some(_) => self.render_doc(self.active.unwrap(), cx),
+            Some(_) => {
+                let ix = self.active.unwrap();
+                let bar = self.render_conflict_bar(ix, cx);
+                let left = v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .children(bar)
+                    .child(self.render_doc(ix, cx));
+                h_flex()
+                    .size_full()
+                    .child(left)
+                    .children(self.render_split(cx))
+                    .into_any_element()
+            }
             None => self.render_empty_editor(cx),
         };
         let has_tabs = !self.docs.is_empty() || self.diff.is_some();
         let switch = self.render_view_switch(cx);
+        let split_button = self.render_split_button(cx);
         // The view switch sits at the end of the tab bar, clear of the
         // editor's own search bar.
         let tabs = has_tabs.then(|| {
@@ -415,6 +442,7 @@ impl Workspace {
                 .border_color(cx.theme().border)
                 .child(div().flex_1().min_w_0().child(self.render_tabs(cx)))
                 .children(switch)
+                .children(split_button)
         });
         v_flex()
             .size_full()
@@ -591,6 +619,8 @@ impl Workspace {
             .and_then(|ix| self.docs.get(ix))
             .filter(|_| !self.diff_active);
         let position = doc.map(|doc| doc.editor.read(cx).cursor_position());
+        let symbol = doc.and_then(|_| self.current_symbol(cx));
+        let (errors, warnings) = self.problems.counts();
         let item = |text: String| {
             div()
                 .px_1p5()
@@ -624,8 +654,52 @@ impl Workspace {
                 )
             })
             .child(div().flex_1())
+            .when(errors + warnings > 0, |this| {
+                let colors = crate::theme::palette(cx);
+                this.child(
+                    h_flex()
+                        .id("problems")
+                        .h(px(20.))
+                        .px_1p5()
+                        .gap_2()
+                        .rounded(px(4.))
+                        .hover(|this| this.bg(theme.list_hover))
+                        .when(errors > 0, |row| {
+                            row.child(
+                                h_flex()
+                                    .gap_1()
+                                    .text_color(colors.red)
+                                    .child(icon("circle-x").xsmall())
+                                    .child(errors.to_string()),
+                            )
+                        })
+                        .when(warnings > 0, |row| {
+                            row.child(
+                                h_flex()
+                                    .gap_1()
+                                    .text_color(colors.yellow)
+                                    .child(icon("triangle-alert").xsmall())
+                                    .child(warnings.to_string()),
+                            )
+                        })
+                        .tooltip(|window, cx| Tooltip::new("问题 (Alt+6)，F2 跳到下一个").build(window, cx))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.on_show_problems(&super::problems_view::ShowProblems, window, cx)
+                        })),
+                )
+            })
             .when_some(doc, |this, doc| {
                 this.child(item(relative_path(&self.root, &doc.path).replace('/', " › ")))
+            })
+            .when_some(symbol, |this, symbol| {
+                this.child(
+                    item(format!("› {symbol}"))
+                        .id("current-symbol")
+                        .text_color(theme.foreground)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.on_show_outline(&super::outline::ShowOutline, window, cx)
+                        })),
+                )
             })
             .when_some(position, |this, position| {
                 this.child(item(format!(
@@ -653,6 +727,8 @@ impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.render_palette(cx);
         let run_configs = self.render_run_configs(cx);
+        let file_prompt = self.render_file_prompt(cx);
+        let hunk = self.render_hunk(cx);
         let autoscroll = self.render_autoscroll(cx);
         let sidebar = self.render_sidebar(cx);
         let center = self.render_center(cx);
@@ -674,15 +750,39 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_new_terminal))
             .on_action(cx.listener(Self::on_show_git_log))
             .on_action(cx.listener(Self::on_find_usages))
+            .on_action(cx.listener(Self::on_show_outline))
+            .on_action(cx.listener(Self::on_split_right))
+            .on_action(cx.listener(Self::on_navigate_back))
+            .on_action(cx.listener(Self::on_extend_selection))
+            .on_action(cx.listener(Self::on_toggle_comment))
+            .on_action(cx.listener(Self::on_duplicate_line))
+            .on_action(cx.listener(Self::on_delete_line))
+            .on_action(cx.listener(Self::on_move_line_up))
+            .on_action(cx.listener(Self::on_move_line_down))
+            .on_action(cx.listener(Self::on_recent_files))
+            .on_action(cx.listener(Self::on_next_problem))
+            .on_action(cx.listener(Self::on_rollback_lines))
+            .on_action(cx.listener(Self::on_previous_problem))
+            .on_action(cx.listener(Self::on_show_problems))
+            .on_action(cx.listener(Self::on_confirm_file_prompt))
+            .on_action(cx.listener(Self::on_cancel_file_prompt))
+            .on_action(cx.listener(Self::on_shrink_selection))
+            .on_action(cx.listener(Self::on_navigate_forward))
+            .on_action(cx.listener(Self::on_close_split))
             .on_action(cx.listener(Self::on_run_program))
             .on_action(cx.listener(Self::on_build_program))
             .on_action(cx.listener(Self::on_stop_program))
             .on_action(cx.listener(Self::on_edit_run_configs))
             .on_action(cx.listener(Self::on_close_run_configs))
             .capture_any_mouse_down(cx.listener(Self::autoscroll_mouse_down))
+            .capture_any_mouse_down(cx.listener(Self::navigation_mouse_down))
+            .capture_any_mouse_down(cx.listener(Self::gutter_mouse_down))
+            .capture_any_mouse_up(cx.listener(Self::navigation_mouse_up))
             .capture_any_mouse_up(cx.listener(Self::autoscroll_mouse_up))
             .on_mouse_move(cx.listener(Self::autoscroll_mouse_move))
             .capture_key_down(cx.listener(Self::autoscroll_key_down))
+            .capture_key_down(cx.listener(Self::shift_key_down))
+            .on_modifiers_changed(cx.listener(Self::shift_modifiers_changed))
             .on_action(cx.listener(Self::on_next_change))
             .on_action(cx.listener(Self::on_previous_change))
             .on_action(cx.listener(Self::on_find_in_preview))
@@ -737,6 +837,8 @@ impl Render for Workspace {
             .child(self.render_status_bar(cx))
             .children(palette)
             .children(run_configs)
+            .children(hunk)
+            .children(file_prompt)
             .children(autoscroll)
     }
 }

@@ -295,6 +295,110 @@ pub fn file_at(root: &Path, rev: &str, path: &str) -> Option<Vec<u8>> {
     output.status.success().then_some(output.stdout)
 }
 
+/// Who last changed a line, and in which commit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlameEntry {
+    pub hash: String,
+    pub author: String,
+    /// Author time, in seconds since the Unix epoch.
+    pub time: i64,
+    pub summary: String,
+}
+
+impl BlameEntry {
+    /// A line changed since the last commit.
+    pub fn uncommitted(&self) -> bool {
+        self.hash.bytes().all(|byte| byte == b'0')
+    }
+}
+
+/// One entry per line of the file.
+pub type Blame = Vec<Option<std::sync::Arc<BlameEntry>>>;
+
+/// Who last changed each line of `contents`, the text of `path` as it is in
+/// the editor; lines edited since the last commit say so.
+pub fn blame(root: &Path, path: &str, contents: &str) -> Option<Blame> {
+    let output = proc::run_with_stdin(
+        "git",
+        &[
+            "-c",
+            "core.quotepath=false",
+            "--no-optional-locks",
+            "blame",
+            "--porcelain",
+            "--contents",
+            "-",
+            "--",
+            path,
+        ],
+        Some(root),
+        contents,
+    )
+    .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_blame(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Read `git blame --porcelain`: a header line per line of the file, with the
+/// commit's details after the first line that names it.
+fn parse_blame(output: &str) -> Blame {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let mut details: HashMap<String, BlameEntry> = HashMap::new();
+    let mut lines: Vec<(usize, String)> = Vec::new();
+    let mut current: Option<(String, usize)> = None;
+    for line in output.lines() {
+        if line.starts_with('\t') {
+            if let Some((hash, row)) = current.take() {
+                lines.push((row, hash));
+            }
+            continue;
+        }
+        let mut words = line.splitn(2, ' ');
+        let (key, value) = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
+        if key.len() == 40 && key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            let row = value
+                .split(' ')
+                .nth(1)
+                .and_then(|row| row.parse::<usize>().ok())
+                .unwrap_or(1);
+            details.entry(key.to_string()).or_insert_with(|| BlameEntry {
+                hash: key.to_string(),
+                author: String::new(),
+                time: 0,
+                summary: String::new(),
+            });
+            current = Some((key.to_string(), row.saturating_sub(1)));
+            continue;
+        }
+        let Some((hash, _)) = &current else {
+            continue;
+        };
+        let Some(entry) = details.get_mut(hash) else {
+            continue;
+        };
+        match key {
+            "author" => entry.author = value.to_string(),
+            "author-time" => entry.time = value.parse().unwrap_or(0),
+            "summary" => entry.summary = value.to_string(),
+            _ => {}
+        }
+    }
+    let shared: HashMap<String, Arc<BlameEntry>> = details
+        .into_iter()
+        .map(|(hash, entry)| (hash, Arc::new(entry)))
+        .collect();
+    let count = lines.iter().map(|(row, _)| row + 1).max().unwrap_or(0);
+    let mut blame: Blame = vec![None; count];
+    for (row, hash) in lines {
+        blame[row] = shared.get(&hash).cloned();
+    }
+    blame
+}
+
 /// Bring remote branches up to date.
 pub fn fetch(root: &Path) -> Result<(), String> {
     git(root, &["fetch", "--all", "--prune", "--quiet"]).map(|_| ())
@@ -421,6 +525,36 @@ pub fn graph(commits: &[Commit]) -> Vec<GraphRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blame_gives_each_line_its_commit() {
+        let a = "a".repeat(40);
+        let zero = "0".repeat(40);
+        let output = [
+            format!("{a} 1 1 2"),
+            "author Ann".into(),
+            "author-time 1700000000".into(),
+            "summary First".into(),
+            "filename f.go".into(),
+            "\tline one".into(),
+            format!("{a} 2 2"),
+            "\tline two".into(),
+            format!("{zero} 3 3 1"),
+            "author Not Committed Yet".into(),
+            "author-time 1800000000".into(),
+            "summary Version of f.go from f.go".into(),
+            "filename f.go".into(),
+            "\tline three".into(),
+        ]
+        .join("\n");
+        let blame = parse_blame(&output);
+        assert_eq!(blame.len(), 3);
+        let first = blame[0].as_ref().unwrap();
+        assert_eq!((first.author.as_str(), first.time, first.summary.as_str()), ("Ann", 1700000000, "First"));
+        assert!(std::sync::Arc::ptr_eq(first, blame[1].as_ref().unwrap()));
+        assert!(blame[2].as_ref().unwrap().uncommitted());
+        assert!(!first.uncommitted());
+    }
 
     fn commit(hash: &str, parents: &[&str]) -> Commit {
         Commit {

@@ -112,6 +112,7 @@ impl Workspace {
             col: hit.col,
             preview: hit.line,
             tag,
+            detail: String::new(),
         };
         let implementations = found.implementations.len();
         let usages = found.usages.len();

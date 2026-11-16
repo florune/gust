@@ -35,6 +35,26 @@ pub struct Comparison {
     pub removed: usize,
 }
 
+/// `new` with the lines of `chunk` replaced by the old side's lines.
+pub fn take_lines(old: &str, new: &str, chunk: &Chunk) -> String {
+    let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
+    let new_lines: Vec<&str> = new.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(new.len());
+    let clamp = |range: &Range<usize>, len: usize| range.start.min(len)..range.end.min(len);
+    let replaced = clamp(&chunk.new, new_lines.len());
+    for line in &new_lines[..replaced.start] {
+        out.push_str(line);
+    }
+    let taken = clamp(&chunk.old, old_lines.len());
+    for line in &old_lines[taken] {
+        out.push_str(line);
+    }
+    for line in &new_lines[replaced.end..] {
+        out.push_str(line);
+    }
+    out
+}
+
 /// Byte offset where each line starts, plus the end of the text.
 fn line_starts(text: &str) -> Vec<usize> {
     let mut starts = vec![0];
@@ -186,6 +206,16 @@ mod tests {
 
     const OLD: &str = "a\nb\nc\nd\ne\nf\n";
     const NEW: &str = "a\nB\nc\ne\nf\ng\nh\n";
+
+    #[test]
+    fn taking_a_chunk_puts_the_old_lines_in_its_place() {
+        let old = "a\nB\nc\nd\n";
+        let new = "a\nb\nc\nx\nd\n";
+        let comparison = compare(old, new);
+        assert_eq!(comparison.chunks.len(), 2);
+        assert_eq!(take_lines(old, new, &comparison.chunks[0]), "a\nB\nc\nx\nd\n");
+        assert_eq!(take_lines(old, new, &comparison.chunks[1]), "a\nb\nc\nd\n");
+    }
 
     #[test]
     fn chunks_tell_added_removed_and_modified_lines_apart() {

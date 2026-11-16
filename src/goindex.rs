@@ -1995,6 +1995,88 @@ fn implementations(
     out
 }
 
+
+// ---------------------------------------------------------------- outline
+
+/// One declaration of a file, for its outline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutlineItem {
+    pub name: String,
+    pub kind: Kind,
+    /// The type a method or field belongs to.
+    pub owner: Option<String>,
+    pub detail: String,
+    pub row: u32,
+    pub col: u32,
+    /// The last line of the declaration.
+    pub end_row: u32,
+}
+
+impl OutlineItem {
+    /// `Type.member`, or the name alone.
+    pub fn full_name(&self) -> String {
+        match &self.owner {
+            Some(owner) => format!("{owner}.{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// Node kinds an outline item spans.
+const DECLARATIONS: &[&str] = &[
+    "function_declaration",
+    "method_declaration",
+    "type_spec",
+    "type_alias",
+    "var_spec",
+    "const_spec",
+    "field_declaration",
+    "method_elem",
+    "method_spec",
+];
+
+/// The declarations of a Go file, in order.
+pub fn outline(source: &str) -> Vec<OutlineItem> {
+    let Some(tree) = parse(source) else {
+        return Vec::new();
+    };
+    let (_, symbols) = file_symbols(source, &tree, &Arc::from(Path::new("")));
+    let mut items: Vec<OutlineItem> = symbols
+        .into_iter()
+        .map(|symbol| {
+            let at = tree_sitter::Point::new(symbol.row as usize, symbol.col as usize);
+            let mut node = tree.root_node().descendant_for_point_range(at, at);
+            let mut end_row = symbol.row;
+            while let Some(current) = node {
+                if DECLARATIONS.contains(&current.kind()) {
+                    end_row = current.end_position().row as u32;
+                    break;
+                }
+                node = current.parent();
+            }
+            OutlineItem {
+                name: symbol.name,
+                kind: symbol.kind,
+                owner: symbol.owner,
+                detail: symbol.detail,
+                row: symbol.row,
+                col: symbol.col,
+                end_row,
+            }
+        })
+        .collect();
+    items.sort_by_key(|item| (item.row, item.col));
+    items
+}
+
+/// The innermost declaration of `items` that line `row` lies in.
+pub fn enclosing(items: &[OutlineItem], row: u32) -> Option<&OutlineItem> {
+    items
+        .iter()
+        .filter(|item| item.row <= row && row <= item.end_row)
+        .max_by_key(|item| (item.row, item.col))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2377,5 +2459,26 @@ mod tests {
         assert_eq!(arity("func(m map[string]int, f func(int, int)) (int, error)"), Some((2, 2)));
         assert_eq!(arity("func(a int) (n int, err error)"), Some((1, 2)));
         assert_eq!(arity("func(a, b, c, d…"), None);
+    }
+
+    #[test]
+    fn the_outline_lists_declarations_with_their_extent() {
+        let source = "package main\n\ntype Room struct {\n\tChips int\n}\n\nfunc (r *Room) Add(n int) {\n\tr.Chips += n\n}\n\nconst Max = 10\n\nfunc main() {\n}\n";
+        let items = outline(source);
+        let names: Vec<(String, u32, u32)> =
+            items.iter().map(|i| (i.full_name(), i.row, i.end_row)).collect();
+        assert_eq!(
+            names,
+            [
+                ("Room".to_string(), 2, 4),
+                ("Room.Chips".to_string(), 3, 3),
+                ("Room.Add".to_string(), 6, 8),
+                ("Max".to_string(), 10, 10),
+                ("main".to_string(), 12, 13),
+            ]
+        );
+        assert_eq!(enclosing(&items, 7).map(OutlineItem::full_name), Some("Room.Add".into()));
+        assert_eq!(enclosing(&items, 3).map(OutlineItem::full_name), Some("Room.Chips".into()));
+        assert_eq!(enclosing(&items, 9), None);
     }
 }

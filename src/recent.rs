@@ -27,6 +27,7 @@ impl RecentProject {
 /// fallbacks; reading looks in all of them.
 fn locations() -> Vec<PathBuf> {
     let mut dirs = vec![crate::settings::config_dir()];
+    dirs.extend(crate::settings::legacy_config_dir());
     if !cfg!(test) {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             dirs.push(PathBuf::from(local).join("Gust"));
@@ -52,6 +53,11 @@ fn merge(lists: impl IntoIterator<Item = Vec<RecentProject>>) -> Vec<RecentProje
     }
     merged.sort_by(|a, b| b.opened.cmp(&a.opened));
     merged
+}
+
+/// The project opened most recently, if its folder still exists.
+pub fn last() -> Option<PathBuf> {
+    load_from(&locations()).first().map(|project| PathBuf::from(&project.path))
 }
 
 /// The projects opened before whose folders still exist, newest first.

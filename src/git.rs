@@ -84,8 +84,16 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 /// The state of the repository containing `dir`, or `None` outside one.
 pub fn status(dir: &Path) -> Option<Status> {
-    let root = git(dir, &["rev-parse", "--show-toplevel"]).ok()?;
-    let root = PathBuf::from(root.trim());
+    // The root is worked out from `dir` rather than taken from git, which
+    // spells it its own way (long names, other case): paths of open files are
+    // matched against it.
+    let up = git(dir, &["rev-parse", "--show-cdup"]).ok()?;
+    let mut root = dir.to_path_buf();
+    for segment in up.trim().split('/').filter(|segment| !segment.is_empty()) {
+        if segment == ".." {
+            root.pop();
+        }
+    }
     let output = git(
         &root,
         &[
@@ -215,6 +223,43 @@ fn change(path: &str, kind: ChangeKind) -> Change {
 /// The committed text of `path`, or `None` when the last commit has no such file.
 pub fn head_text(root: &Path, path: &str) -> Option<String> {
     git(root, &["show", &format!("HEAD:{path}")]).ok()
+}
+
+/// Delete a file the last commit does not have: to the Recycle Bin, or for
+/// good in tests.
+fn remove_new_file(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let removed = if cfg!(test) {
+        std::fs::remove_file(path).map_err(|err| err.to_string())
+    } else {
+        trash::delete(path).map_err(|err| err.to_string())
+    };
+    removed.map_err(|err| format!("无法删除：{err}"))
+}
+
+/// Take `change` back to the last commit, in the index and on disk. A file
+/// the last commit does not have is deleted.
+pub fn rollback(root: &Path, change: &Change) -> Result<(), String> {
+    let restore = |path: &str| {
+        git(root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", path]).map(|_| ())
+    };
+    match change.kind {
+        ChangeKind::Untracked => remove_new_file(&root.join(&change.path)),
+        ChangeKind::Added => {
+            git(root, &["rm", "--cached", "--quiet", "--force", "--", &change.path])?;
+            remove_new_file(&root.join(&change.path))
+        }
+        ChangeKind::Renamed => {
+            if let Some(old) = &change.old_path {
+                restore(old)?;
+            }
+            let _ = git(root, &["rm", "--cached", "--quiet", "--force", "--", &change.path]);
+            remove_new_file(&root.join(&change.path))
+        }
+        ChangeKind::Modified | ChangeKind::Deleted | ChangeKind::Conflict => restore(&change.path),
+    }
 }
 
 /// Commit the working-tree state of `paths`, and nothing else.

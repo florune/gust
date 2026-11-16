@@ -181,6 +181,35 @@ pub fn line_edits(old: &str, new: &str) -> Vec<TextEdit> {
     edits
 }
 
+/// One edit, of whole lines, that turns `old` into `new`: what lies between
+/// the lines they share at the start and at the end. Applied as one, it is
+/// undone as one.
+pub fn single_edit(old: &str, new: &str) -> Option<TextEdit> {
+    if old == new {
+        return None;
+    }
+    let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
+    let new_lines: Vec<&str> = new.split_inclusive('\n').collect();
+    let head = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let tail = old_lines[head..]
+        .iter()
+        .rev()
+        .zip(new_lines[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    Some(TextEdit {
+        range: Range {
+            start: Position::new(head as u32, 0),
+            end: Position::new((old_lines.len() - tail) as u32, 0),
+        },
+        new_text: new_lines[head..new_lines.len() - tail].concat(),
+    })
+}
+
 /// Where a caret at `position` in `old` belongs in `new`.
 ///
 /// On a line the formatter left alone the column is kept; on one it rewrote,

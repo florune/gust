@@ -16,6 +16,27 @@ pub struct ProjectSettings {
     /// Run configurations, and which one the run button starts.
     pub runs: Vec<crate::run::RunConfig>,
     pub selected_run: usize,
+    /// What was open when the project was last left.
+    pub session: Session,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Session {
+    /// The open files in tab order, from the project root.
+    pub open: Vec<OpenFile>,
+    pub active: Option<String>,
+    /// Files opened last, the latest first, for Ctrl+E.
+    pub recent: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenFile {
+    pub path: String,
+    /// The caret: zero-based line and byte column.
+    pub row: u32,
+    pub col: u32,
 }
 
 /// Whether `relative` is one of `hidden` or lies inside one of them.
@@ -28,13 +49,29 @@ pub fn is_hidden(hidden: &[String], relative: &str) -> bool {
     })
 }
 
-/// Where Gust keeps its own files.
+/// Where Gust keeps its own files: `.gust` in the user's home folder.
+///
+/// Not `%APPDATA%`: Windows gives a program started from inside a packaged
+/// app (such as an AI tool) its own private copy of that folder, so Gust
+/// started from there and Gust started from Explorer would each keep a list
+/// the other cannot see.
 pub fn config_dir() -> PathBuf {
     if cfg!(test) {
         return std::env::temp_dir().join(format!("gust-test-config-{}", std::process::id()));
     }
     if let Some(dir) = std::env::var_os("GUST_CONFIG_DIR") {
         return PathBuf::from(dir);
+    }
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    home.map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".gust")
+}
+
+/// Where earlier versions kept their files; still read, never written.
+pub fn legacy_config_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
     }
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
@@ -43,12 +80,16 @@ pub fn config_dir() -> PathBuf {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
     };
-    base.unwrap_or_else(std::env::temp_dir).join("Gust")
+    base.map(|base| base.join("Gust"))
 }
 
 /// The settings file of the project at `root`: one per folder, named by a
 /// hash of its path so that every folder gets its own.
 fn settings_file(root: &Path) -> PathBuf {
+    settings_file_in(&config_dir(), root)
+}
+
+fn settings_file_in(config: &Path, root: &Path) -> PathBuf {
     let key = root.to_string_lossy().replace('\\', "/").to_lowercase();
     // FNV-1a: stable across runs and Rust versions, unlike the std hasher.
     let hash = key
@@ -60,7 +101,7 @@ fn settings_file(root: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    config_dir()
+    config
         .join("projects")
         .join(format!("{name}-{hash:016x}.json"))
 }
@@ -74,7 +115,12 @@ fn local_file(root: &Path) -> PathBuf {
 }
 
 pub fn load(root: &Path) -> ProjectSettings {
-    load_from(&settings_file(root), root)
+    let file = settings_file(root);
+    // Settings saved where earlier versions kept them, until saved again.
+    let legacy = legacy_config_dir()
+        .map(|dir| settings_file_in(&dir, root))
+        .filter(|legacy| !file.is_file() && legacy.is_file());
+    load_from(legacy.as_ref().unwrap_or(&file), root)
 }
 
 /// Read the project's settings: from inside the project when they were saved

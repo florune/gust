@@ -203,6 +203,10 @@ impl Workspace {
         .item(act("在文件树中显示", true, |this, path, _, cx| {
             this.reveal(path, cx)
         }))
+        .separator()
+        .item(act("向右拆分", true, |this, path, window, cx| {
+            this.split_right(path, window, cx)
+        }))
     }
 
     pub(super) fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -211,6 +215,7 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let order = self.tab_order();
         let count = order.len();
+        let split_path = self.split.as_ref().map(|split| split.path.clone());
 
         let tab = |id: ElementId, group: SharedString, active: bool| {
             h_flex()
@@ -296,6 +301,9 @@ impl Workspace {
                         tab(("tab", ix).into(), group.clone(), active)
                             .child(file_icon(&doc.title, cx).small())
                             .child(doc.title.clone())
+                            .when(split_path.as_ref() == Some(&doc.path), |tab| {
+                                tab.child(icon("columns-2").xsmall().text_color(theme.muted_foreground))
+                            })
                             .child(
                                 close_button(("tab-close", ix).into(), group, active, doc.dirty)
                                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -304,7 +312,7 @@ impl Workspace {
                                     })),
                             )
                             .on_click(
-                                cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)),
+                                cx.listener(move |this, _, window, cx| this.select_tab(ix, window, cx)),
                             )
                             .on_drag(
                                 DraggedTab {

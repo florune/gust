@@ -28,6 +28,10 @@ pub enum FileTreeEvent {
     /// Hide the file or folder from this project's views.
     Hide(PathBuf),
     Unhide(PathBuf),
+    /// Make a file, or with `folder` a folder, in `dir`.
+    New { dir: PathBuf, folder: bool },
+    Rename(PathBuf),
+    Delete(PathBuf),
 }
 
 /// The project's files as a flat list of the rows currently visible.
@@ -67,6 +71,11 @@ impl FileTree {
         };
         tree.reload();
         tree
+    }
+
+    /// The row last clicked.
+    pub fn selected(&self) -> Option<&Path> {
+        self.selected.as_deref()
     }
 
     pub fn set_root(&mut self, root: PathBuf, hidden: Vec<String>, cx: &mut Context<Self>) {
@@ -216,6 +225,7 @@ impl FileTree {
         let node = &self.nodes[ix];
         let selected = self.selected.as_deref() == Some(node.path.as_path());
         let expanded = node.is_dir && self.expanded.contains(&node.path);
+        let is_dir = node.is_dir;
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let name_color = if node.is_dir {
@@ -281,6 +291,34 @@ impl FileTree {
             .context_menu(move |menu, _, _| {
                 let path = menu_path.clone();
                 let toggle = tree.clone();
+                // New things go into the folder, or beside the file.
+                let dir = if is_dir {
+                    menu_path.clone()
+                } else {
+                    menu_path.parent().map(PathBuf::from).unwrap_or_default()
+                };
+                let emit = |label: &'static str, event: fn(PathBuf) -> FileTreeEvent, target: PathBuf| {
+                    let tree = tree.clone();
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        let target = target.clone();
+                        tree.update(cx, |_, cx| cx.emit(event(target))).ok();
+                    })
+                };
+                let menu = menu
+                    .item(emit(
+                        "新建文件…",
+                        |dir| FileTreeEvent::New { dir, folder: false },
+                        dir.clone(),
+                    ))
+                    .item(emit(
+                        "新建文件夹…",
+                        |dir| FileTreeEvent::New { dir, folder: true },
+                        dir,
+                    ))
+                    .separator()
+                    .item(emit("重命名…", FileTreeEvent::Rename, menu_path.clone()))
+                    .item(emit("删除…", FileTreeEvent::Delete, menu_path.clone()))
+                    .separator();
                 let absolute = menu_path.to_string_lossy().into_owned();
                 let relative = relative.clone();
                 let reveal = menu_path.clone();

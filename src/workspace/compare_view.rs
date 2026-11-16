@@ -4,7 +4,7 @@
 //! Lines are never wrapped, so line 365 is always one row.
 
 use std::cell::Cell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -45,6 +45,8 @@ pub(super) enum Source {
     WorkingTree,
     /// A commit against its first parent.
     Commit(Commit),
+    /// A file as it is on disk against its unsaved edits.
+    Disk { file: PathBuf, mine: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -145,7 +147,7 @@ impl DiffTab {
     pub fn working_path(&self) -> Option<String> {
         match self.source {
             Source::WorkingTree => self.entry().map(|entry| entry.path.clone()),
-            Source::Commit(_) => None,
+            Source::Commit(_) | Source::Disk { .. } => None,
         }
     }
 }
@@ -182,6 +184,12 @@ fn read_versions(root: &Path, source: &Source, entry: &Entry) -> (Side, Side, St
                 .flatten();
             (side(old), side(new), "HEAD".into(), "工作区".into())
         }
+        Source::Disk { file, mine } => (
+            side(std::fs::read(file).ok()),
+            Ok(mine.clone()),
+            "磁盘上的版本（外部修改）".into(),
+            "你的修改（未保存）".into(),
+        ),
         Source::Commit(commit) => {
             let parent = commit.parents.first();
             let old = parent
@@ -259,7 +267,7 @@ impl Workspace {
         self.show_compare(Source::Commit(commit), entries, selected, window, cx);
     }
 
-    fn show_compare(
+    pub(super) fn show_compare(
         &mut self,
         source: Source,
         entries: Vec<Entry>,
@@ -297,7 +305,7 @@ impl Workspace {
 
     /// Read the selected file's two versions and show them; `keep_scroll`
     /// leaves the view where it was when the same file is read again.
-    fn load_compare(&mut self, keep_scroll: bool, cx: &mut Context<Self>) {
+    pub(super) fn load_compare(&mut self, keep_scroll: bool, cx: &mut Context<Self>) {
         let root = self.diff_root();
         let window = self.window;
         let Some(tab) = &mut self.diff else {
@@ -312,6 +320,7 @@ impl Workspace {
         let short = match &tab.source {
             Source::Commit(commit) => format!("{} · ", commit.short()),
             Source::WorkingTree => String::new(),
+            Source::Disk { .. } => "冲突 · ".to_string(),
         };
         tab.title = format!("{short}{}", entry.name()).into();
         let source = tab.source.clone();
@@ -672,16 +681,27 @@ impl Workspace {
         let colors = palette(cx);
         let (added, removed) = tab.counts();
         let entry = tab.entry().cloned();
-        let open_path = entry
-            .as_ref()
-            .filter(|entry| entry.status != 'D')
-            .map(|entry| self.diff_root().join(&entry.path))
-            .filter(|path| path.is_file());
+        let open_path = match &tab.source {
+            Source::Disk { file, .. } => Some(file.clone()),
+            _ => entry
+                .as_ref()
+                .filter(|entry| entry.status != 'D')
+                .map(|entry| self.diff_root().join(&entry.path))
+                .filter(|path| path.is_file()),
+        };
+        // The open file whose disk version is compared, to settle the conflict.
+        let conflict = match &tab.source {
+            Source::Disk { file, .. } => self.docs.iter().position(|doc| &doc.path == file),
+            _ => None,
+        };
         let label = match (&tab.source, &entry) {
             (Source::Commit(commit), Some(entry)) => {
                 format!("{} · {} · {}", commit.short(), entry.path, commit.subject)
             }
             (Source::WorkingTree, Some(entry)) => format!("{} · 相对上次提交", entry.path),
+            (Source::Disk { .. }, Some(entry)) => {
+                format!("{} · 点中间的箭头，把磁盘上的那一块用到你的版本里", entry.path)
+            }
             (_, None) => "没有改动".to_string(),
         };
         let header_button = |id: &'static str, glyph: &'static str, tip: &'static str| {
@@ -719,6 +739,26 @@ impl Workspace {
                     cx.listener(|this, _, window, cx| this.step_change(true, window, cx)),
                 ),
             )
+            .when_some(conflict, |row, ix| {
+                use gpui_kit::component::button::{Button, ButtonVariants as _};
+                row.child(
+                    Button::new("disk-take-all")
+                        .xsmall()
+                        .label("全部用磁盘版本")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.take_disk(ix, window, cx)
+                        })),
+                )
+                .child(
+                    Button::new("disk-keep-mine")
+                        .xsmall()
+                        .primary()
+                        .label("保留我的修改")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.keep_mine(ix, window, cx)
+                        })),
+                )
+            })
             .when_some(open_path, |row, path| {
                 row.child(
                     div()
@@ -749,7 +789,10 @@ impl Workspace {
                 .text_color(theme.muted_foreground)
                 .child(view.note.clone().unwrap())
                 .into_any_element(),
-            Some(view) => self.render_sides(view, cx),
+            Some(view) => {
+                let mergeable = matches!(tab.source, Source::Disk { .. });
+                self.render_sides(view, mergeable, cx)
+            }
         };
         v_flex()
             .size_full()
@@ -764,7 +807,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_sides(&self, view: &CompareView, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sides(&self, view: &CompareView, mergeable: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let colors = palette(cx);
         let dark = theme.is_dark();
@@ -853,15 +896,40 @@ impl Workspace {
                             if let Ok(path) = path.build() {
                                 window.paint_path(path, band(kind_color(chunk.kind)));
                             }
+                            // An arrow that takes the left side's lines.
+                            if mergeable {
+                                let y = (a + b.max(a + l.height)) / 2.;
+                                let x = x0 + px(6.);
+                                let mut arrow = PathBuilder::fill();
+                                arrow.move_to(point(x, y - px(6.)));
+                                arrow.line_to(point(x + px(9.), y));
+                                arrow.line_to(point(x, y + px(6.)));
+                                arrow.close();
+                                if let Ok(arrow) = arrow.build() {
+                                    window.paint_path(arrow, kind_color(chunk.kind));
+                                }
+                            }
                         }
                     });
                 },
             )
+            .size_full()
+        };
+        let strip = div()
+            .id("compare-strip")
             .w(px(STRIP))
             .h_full()
             .flex_shrink_0()
             .bg(theme.sidebar)
-        };
+            .when(mergeable, |strip| {
+                strip.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        this.take_disk_chunk_at(event.position.y, window, cx)
+                    }),
+                )
+            })
+            .child(strip);
 
         let pane = |editor: &Entity<EditorState>, old: bool| {
             div()
@@ -911,5 +979,55 @@ impl Workspace {
                     .child(pane(&view.right, false)),
             )
             .into_any_element()
+    }
+
+    /// In a disk compare, the change beside height `y` of the strip.
+    fn take_disk_chunk_at(&mut self, y: Pixels, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.diff.as_ref().and_then(|tab| tab.view.as_ref()) else {
+            return;
+        };
+        let (Some(l), Some(r)) = (Rows::of(view.left.read(cx)), Rows::of(view.right.read(cx))) else {
+            return;
+        };
+        let found = view.comparison.chunks.iter().position(|chunk| {
+            let top = l.y(chunk.old.start).min(r.y(chunk.new.start));
+            let bottom = l.y(chunk.old.end).max(r.y(chunk.new.end)).max(top + l.height);
+            (top - px(2.)..bottom + px(2.)).contains(&y)
+        });
+        if let Some(ix) = found {
+            self.take_disk_chunk(ix, window, cx);
+        }
+    }
+
+    /// In a disk compare, take the disk's lines of change `ix` into the open file.
+    pub(super) fn take_disk_chunk(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = &self.diff else {
+            return;
+        };
+        let Source::Disk { file, .. } = &tab.source else {
+            return;
+        };
+        let Some(view) = &tab.view else {
+            return;
+        };
+        let Some(chunk) = view.comparison.chunks.get(ix).cloned() else {
+            return;
+        };
+        let disk = view.left.read(cx).text().to_string();
+        let shown = view.right.read(cx).text().to_string();
+        let file = file.clone();
+        let Some(doc) = self.docs.iter().find(|doc| doc.path == file) else {
+            return;
+        };
+        let editor = doc.editor.clone();
+        let mine = editor.read(cx).text().to_string();
+        // The compare is behind the editor: let it catch up first.
+        if mine != shown {
+            self.refresh_disk_compare(&file, cx);
+            return;
+        }
+        let merged = crate::compare::take_lines(&disk, &mine, &chunk);
+        super::replace_text(&editor, &mine, &merged, window, cx);
+        self.refresh_dirty(&editor, cx);
     }
 }

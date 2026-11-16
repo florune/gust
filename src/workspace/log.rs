@@ -64,7 +64,7 @@ impl GitLog {
 
 /// When something happened, the way a log reads best: recent times by the
 /// day, older ones by date.
-fn when(time: i64) -> String {
+pub(super) fn when(time: i64) -> String {
     let Some(at) = Local.timestamp_opt(time, 0).single() else {
         return String::new();
     };

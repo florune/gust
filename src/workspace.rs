@@ -8,7 +8,7 @@ use gpui_kit::component::input::{
     EditorState, GoToDefinition, GutterDecorationCollection, InputEvent, Position,
     ShowCompletions, TabSize, TextareaState, highlight_characters,
 };
-use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
+use gpui_kit::component::{ActiveTheme as _, ThemeMode};
 use gpui_kit::*;
 
 use crate::complete::{GoFile, uri_to_path, usages_target};
@@ -21,13 +21,24 @@ use crate::settings::{self, ProjectSettings};
 use crate::terminal::{TerminalEvent, TerminalView};
 
 mod autoscroll;
+mod blame;
 mod changes;
 mod compare_view;
+mod file_ops;
+mod conflict;
+mod editing;
 mod layout;
 mod log;
 mod markdown;
+mod navigation;
+mod outline;
 mod palette;
+mod problems_view;
+mod rollback;
 mod run_panel;
+mod selection;
+mod session;
+mod split;
 mod tabs;
 mod usages;
 
@@ -63,7 +74,6 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-s", Save, workspace),
         KeyBinding::new("ctrl-alt-l", Format, workspace),
         KeyBinding::new("shift-alt-f", Format, workspace),
-        KeyBinding::new("ctrl-w", CloseTab, workspace),
         KeyBinding::new("ctrl-f4", CloseTab, workspace),
         KeyBinding::new("alt-1", ToggleSidebar, workspace),
         KeyBinding::new("alt-0", ShowCommit, workspace),
@@ -80,6 +90,13 @@ pub fn init(cx: &mut App) {
     markdown::init(cx);
     compare_view::init(cx);
     usages::init(cx);
+    outline::init(cx);
+    navigation::init(cx);
+    selection::init(cx);
+    file_ops::init(cx);
+    editing::init(cx);
+    problems_view::init(cx);
+    rollback::init(cx);
     run_panel::init(cx);
 }
 
@@ -100,6 +117,15 @@ struct Doc {
     /// Source, preview, or both: Markdown only.
     view: DocView,
     preview: Option<Preview>,
+    /// The declarations of a Go file, read again after edits.
+    outline: Rc<Vec<crate::goindex::OutlineItem>>,
+    outline_task: Task<()>,
+    /// The disk's text, when the file changed there under unsaved edits;
+    /// nothing is written until the user picks a side.
+    conflict: Option<String>,
+    /// Who last changed each line, for the note after the caret's line.
+    blame: Rc<crate::history::Blame>,
+    blame_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -139,6 +165,31 @@ pub struct Workspace {
     usages_search: Task<()>,
     /// Run configurations, the build, and the program's console.
     run: run_panel::RunState,
+    /// The right pane, when the editor is split.
+    split: Option<split::Split>,
+    /// Places the caret was before jumps, for Back; and after, for Forward.
+    back: Vec<navigation::Place>,
+    forward: Vec<navigation::Place>,
+    /// Going back or forward, which is not itself a jump to remember.
+    navigating: bool,
+    /// The editor went to a definition by itself during the last Ctrl+press.
+    jumped: Rc<std::cell::Cell<bool>>,
+    /// Where a Ctrl+press started, until its release.
+    ctrl_click: Option<Point<Pixels>>,
+    /// A press is being sent again with other modifiers.
+    remapping: Rc<std::cell::Cell<bool>>,
+    /// The steps of Extend Selection, for Shrink Selection.
+    expansions: selection::Expansions,
+    /// Taps of Shift, for the double tap that opens the file search.
+    shift_taps: palette::ShiftTaps,
+    /// The box asking for a new name, or whether to delete.
+    file_prompt: Option<file_ops::FilePrompt>,
+    /// Files shown, the last one first, for Ctrl+E.
+    recent_files: Vec<PathBuf>,
+    /// Compile errors and vet findings, by package.
+    problems: problems_view::Problems,
+    /// The committed lines of a change, shown after a click on its mark.
+    hunk: Option<rollback::Hunk>,
     /// The project's files, listed once and kept until something changes on disk.
     project_files: Option<Arc<Vec<String>>>,
     terminals: Vec<TerminalTab>,
@@ -177,12 +228,27 @@ impl Workspace {
                     FileTreeEvent::Open(path) => this.open(path.clone(), window, cx),
                     FileTreeEvent::Hide(path) => this.set_path_hidden(path, true, cx),
                     FileTreeEvent::Unhide(path) => this.set_path_hidden(path, false, cx),
+                    FileTreeEvent::New { dir, folder } => this.open_file_prompt(
+                        file_ops::FileAction::New {
+                            dir: dir.clone(),
+                            folder: *folder,
+                        },
+                        window,
+                        cx,
+                    ),
+                    FileTreeEvent::Rename(path) => {
+                        this.open_file_prompt(file_ops::FileAction::Rename(path.clone()), window, cx)
+                    }
+                    FileTreeEvent::Delete(path) => {
+                        this.open_file_prompt(file_ops::FileAction::Delete(path.clone()), window, cx)
+                    }
                 },
             ),
             // Like GoLand: leaving the window saves, so tools outside it see
             // what the editor shows.
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
+                    this.remember_session(cx);
                     this.save_all(cx);
                     this.stop_autoscroll(cx);
                 }
@@ -238,6 +304,19 @@ impl Workspace {
             palette: None,
             usages_search: Task::ready(()),
             run: run_panel::RunState::new(),
+            split: None,
+            back: Vec::new(),
+            forward: Vec::new(),
+            navigating: false,
+            jumped: Rc::default(),
+            ctrl_click: None,
+            remapping: Rc::default(),
+            expansions: Default::default(),
+            shift_taps: Default::default(),
+            file_prompt: None,
+            recent_files: Vec::new(),
+            problems: Default::default(),
+            hunk: None,
             project_files: None,
             terminals: Vec::new(),
             active_terminal: 0,
@@ -259,6 +338,9 @@ impl Workspace {
         this.watch(window, cx);
         // Keys reach the workspace through whatever inside it has focus.
         this.focus.focus(window, cx);
+        this.restore_session(window, cx);
+        // Closing the window keeps the session for next time.
+        cx.on_release(|this, cx| this.remember_session(cx)).detach();
         this
     }
 
@@ -350,21 +432,35 @@ impl Workspace {
         };
         let crlf = raw.contains("\r\n");
         let on_disk = if crlf { raw.replace("\r\n", "\n") } else { raw };
-        if on_disk == doc.saved {
+        let editor = doc.editor.clone();
+        let mine = editor.read(cx).text().to_string();
+        let doc = &mut self.docs[ix];
+        if on_disk == doc.saved || on_disk == mine {
+            // Back to what was read, or the same as the edits: nothing to decide.
+            let settled = doc.conflict.take().is_some();
+            doc.saved = on_disk;
+            doc.crlf = crlf;
+            if settled {
+                let path = doc.path.clone();
+                self.refresh_dirty(&editor, cx);
+                self.refresh_disk_compare(&path, cx);
+                cx.notify();
+            }
             return;
         }
-        let editor = doc.editor.clone();
         if doc.dirty {
-            // Unsaved edits win; say so, since saving will overwrite the file.
-            self.notice = Some(format!("{} 在磁盘上被修改了，保存会覆盖它", doc.title).into());
+            // Neither side is dropped: the user decides.
+            doc.conflict = Some(on_disk);
+            doc.crlf = crlf;
+            let path = doc.path.clone();
+            self.refresh_disk_compare(&path, cx);
         } else {
-            let before = editor.read(cx).text().to_string();
-            replace_text(&editor, &before, &on_disk, window, cx);
+            replace_text(&editor, &mine, &on_disk, window, cx);
+            let doc = &mut self.docs[ix];
+            doc.saved = on_disk;
+            doc.crlf = crlf;
+            self.refresh_dirty(&editor, cx);
         }
-        let doc = &mut self.docs[ix];
-        doc.saved = on_disk;
-        doc.crlf = crlf;
-        self.refresh_dirty(&editor, cx);
         cx.notify();
     }
 
@@ -394,9 +490,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Write every file with unsaved edits, except those whose disk version
+    /// changed under them: those wait for the user's decision.
     fn save_all(&mut self, cx: &mut Context<Self>) {
         for ix in 0..self.docs.len() {
-            if self.docs[ix].dirty {
+            if self.docs[ix].dirty && self.docs[ix].conflict.is_none() {
                 self.write_doc(ix, cx);
             }
         }
@@ -411,8 +509,17 @@ impl Workspace {
     }
 
     pub fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        // With the right pane in use, files open there.
+        let to_split = self.split_focused() && !self.diff_active;
+        if self.current_place(cx).is_some_and(|here| here.path != path) {
+            self.remember_place(cx);
+        }
         if let Some(ix) = self.docs.iter().position(|d| d.path == path) {
-            self.activate(ix, window, cx);
+            if to_split {
+                self.split_right(&path, window, cx);
+            } else {
+                self.activate(ix, window, cx);
+            }
             return;
         }
         let Ok(bytes) = std::fs::read(&path) else {
@@ -437,53 +544,19 @@ impl Workspace {
                 .default_value(text.clone())
         });
         if language == "go" {
-            let go = Rc::new(GoFile {
-                index: self.index.clone(),
-                path: path.clone(),
-            });
-            let workspace = cx.entity().downgrade();
-            editor.update(cx, |editor, _| {
-                let lsp = editor.lsp_mut();
-                lsp.completion_provider = Some(go.clone());
-                lsp.definition_provider = Some(go);
-                lsp.completion_menu.max_width = px(560.);
-                lsp.set_completion_highlighter(Rc::new(highlight_characters));
-                // Definitions may be in another file, which only the workspace can show.
-                // A declaration "goes to" its usages instead.
-                lsp.show_document = Some(Rc::new(move |params, window, cx| {
-                    let usages = usages_target(&params.uri);
-                    let Some(path) = usages.clone().or_else(|| uri_to_path(&params.uri)) else {
-                        return true;
-                    };
-                    let start = params.selection.map(|range| range.start).unwrap_or_default();
-                    let workspace = workspace.clone();
-                    // Deferred: the editor asking is still being updated.
-                    window.defer(cx, move |window, cx| {
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                if usages.is_some() {
-                                    workspace.show_usages_at(
-                                        path,
-                                        start.line,
-                                        start.character,
-                                        window,
-                                        cx,
-                                    )
-                                } else {
-                                    workspace.open_at(path, start.line, start.character, window, cx)
-                                }
-                            })
-                            .ok();
-                    });
-                    true
-                }));
-            });
+            self.attach_go(&editor, &path, cx);
         }
         let subscriptions = vec![
-            cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.refresh_dirty(&editor, cx);
+            cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| match event {
+                InputEvent::Change => this.refresh_dirty(&editor, cx),
+                // The left pane is the one in use now.
+                InputEvent::Focus => {
+                    if let Some(split) = &mut this.split {
+                        split.focused = false;
+                        cx.notify();
+                    }
                 }
+                _ => {}
             }),
             // Scrolling the source moves a split preview along with it.
             cx.observe(&editor, |this, editor, cx| {
@@ -515,10 +588,70 @@ impl Workspace {
                 DocView::Edit
             },
             preview,
+            outline: Rc::default(),
+            outline_task: Task::ready(()),
+            conflict: None,
+            blame: Rc::default(),
+            blame_task: Task::ready(()),
             _subscriptions: subscriptions,
         });
-        self.activate(self.docs.len() - 1, window, cx);
+        self.refresh_outline(self.docs.len() - 1, true, cx);
+        let opened = self.docs[self.docs.len() - 1].path.clone();
+        self.check_package(&opened, cx);
+        if to_split {
+            let path = self.docs[self.docs.len() - 1].path.clone();
+            self.split_right(&path, window, cx);
+        } else {
+            self.activate(self.docs.len() - 1, window, cx);
+        }
         self.load_head(self.docs.len() - 1, cx);
+    }
+
+    /// Completion, definitions, and usages for an editor of the Go file `path`.
+    fn attach_go(&self, editor: &Entity<EditorState>, path: &Path, cx: &mut Context<Self>) {
+        let go = Rc::new(GoFile {
+            index: self.index.clone(),
+            path: path.to_path_buf(),
+        });
+        let jumped = self.jumped.clone();
+        let workspace = cx.entity().downgrade();
+        editor.update(cx, |editor, _| {
+            let lsp = editor.lsp_mut();
+            lsp.completion_provider = Some(go.clone());
+            lsp.definition_provider = Some(go);
+            lsp.completion_menu.max_width = px(560.);
+            lsp.set_completion_highlighter(Rc::new(highlight_characters));
+            // Definitions may be in another file, which only the workspace can show.
+            // A declaration "goes to" its usages instead.
+            lsp.show_document = Some(Rc::new(move |params, window, cx| {
+                jumped.set(true);
+                let usages = usages_target(&params.uri);
+                let Some(path) = usages.clone().or_else(|| uri_to_path(&params.uri)) else {
+                    return true;
+                };
+                let start = params.selection.map(|range| range.start).unwrap_or_default();
+                let workspace = workspace.clone();
+                // Deferred: the editor asking is still being updated.
+                window.defer(cx, move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            if usages.is_some() {
+                                workspace.show_usages_at(
+                                    path,
+                                    start.line,
+                                    start.character,
+                                    window,
+                                    cx,
+                                )
+                            } else {
+                                workspace.open_at(path, start.line, start.character, window, cx)
+                            }
+                        })
+                        .ok();
+                });
+                true
+            }));
+        });
     }
 
     /// Open `path` with the caret at `row` and byte column `col`.
@@ -530,11 +663,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .current_place(cx)
+            .is_some_and(|here| here.path == path && here.row != row)
+        {
+            self.remember_place(cx);
+        }
         self.open(path.clone(), window, cx);
         let Some(doc) = self.docs.iter().find(|doc| doc.path == path) else {
             return;
         };
-        doc.editor.update(cx, |editor, cx| {
+        // The file may have opened in the right pane.
+        let editor = match &self.split {
+            Some(split) if split.focused && split.path == path => split.editor.clone(),
+            _ => doc.editor.clone(),
+        };
+        editor.update(cx, |editor, cx| {
             let character = editor
                 .text()
                 .to_string()
@@ -558,6 +702,10 @@ impl Workspace {
         };
         self.active = Some(ix);
         self.diff_active = false;
+        // The left pane is in use now; focus events only arrive next frame.
+        if let Some(split) = &mut self.split {
+            split.focused = false;
+        }
         // A preview has no caret; keys go to the window instead.
         if doc.view == DocView::Preview {
             self.focus.focus(window, cx);
@@ -565,6 +713,7 @@ impl Workspace {
             doc.editor.update(cx, |editor, cx| editor.focus(window, cx));
         }
         let path = doc.path.clone();
+        self.note_recent_file(&path);
         self.tree.update(cx, |tree, cx| tree.select(&path, cx));
         cx.notify();
     }
@@ -574,6 +723,15 @@ impl Workspace {
             return;
         };
         let doc = &mut self.docs[ix];
+        // Edits that came to match the disk's version settle a conflict.
+        if doc
+            .conflict
+            .as_ref()
+            .is_some_and(|disk| *editor.read(cx).text() == disk.as_str())
+        {
+            doc.saved = doc.conflict.take().unwrap_or_default();
+            cx.notify();
+        }
         let dirty = *editor.read(cx).text() != doc.saved.as_str();
         if dirty != doc.dirty {
             doc.dirty = dirty;
@@ -581,6 +739,10 @@ impl Workspace {
         }
         self.refresh_gutter(ix, cx);
         self.update_preview(ix, cx);
+        self.refresh_outline(ix, false, cx);
+        self.refresh_blame(ix, false, cx);
+        let path = self.docs[ix].path.clone();
+        self.refresh_disk_compare(&path, cx);
     }
 
     /// Write the editor's text to disk as it is.
@@ -598,6 +760,10 @@ impl Workspace {
             Ok(()) => {
                 doc.saved = text;
                 doc.dirty = false;
+                // Saving on purpose keeps these edits over the disk's.
+                doc.conflict = None;
+                let saved = doc.path.clone();
+                self.check_package(&saved, cx);
                 self.refresh_git(cx);
             }
             Err(err) => self.notice = Some(format!("保存失败：{err}").into()),
@@ -663,11 +829,21 @@ impl Workspace {
         if ix >= self.docs.len() {
             return;
         }
+        // A file in conflict stays open until the user picks a side.
+        if self.docs[ix].conflict.is_some() {
+            self.activate(ix, window, cx);
+            self.notice = Some(format!("{} 有冲突，先选保留哪个版本", self.docs[ix].title).into());
+            cx.notify();
+            return;
+        }
         // Like GoLand, nothing is lost on close: unsaved edits are written out.
         if self.docs[ix].dirty {
             self.write_doc(ix, cx);
         }
-        self.docs.remove(ix);
+        let removed = self.docs.remove(ix);
+        if self.split.as_ref().is_some_and(|split| split.path == removed.path) {
+            self.split = None;
+        }
         if ix < self.diff_slot {
             self.diff_slot -= 1;
         }
@@ -687,6 +863,7 @@ impl Workspace {
     }
 
     fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_session(cx);
         for ix in 0..self.docs.len() {
             if self.docs[ix].dirty {
                 self.write_doc(ix, cx);
@@ -707,6 +884,10 @@ impl Workspace {
         self.project_files = None;
         // The program of the old project stops with it.
         self.run = run_panel::RunState::new();
+        self.problems = Default::default();
+        self.split = None;
+        self.back.clear();
+        self.forward.clear();
         self.recent = crate::recent::record(&root);
         self.root = root.clone();
         self.settings = settings::load(&root);
@@ -718,6 +899,8 @@ impl Workspace {
         self.refresh_git(cx);
         self.watch(window, cx);
         self.focus.focus(window, cx);
+        self.recent_files.clear();
+        self.restore_session(window, cx);
         cx.notify();
     }
 
@@ -825,7 +1008,9 @@ impl Workspace {
     }
 
     fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        if self.diff_active {
+        if self.split_focused() && !self.diff_active {
+            self.close_split(window, cx);
+        } else if self.diff_active {
             self.close_diff(window, cx);
         } else if let Some(ix) = self.active {
             self.close(ix, window, cx);
@@ -850,7 +1035,7 @@ impl Workspace {
         } else {
             ThemeMode::Dark
         };
-        Theme::change(mode, None, cx);
+        crate::theme::change(mode, cx);
     }
 
     fn on_open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
@@ -875,6 +1060,7 @@ impl Workspace {
 
 /// Turn the editor's text from `before` into `after` by editing only the
 /// lines that differ, so the caret, the scroll position, and undo survive.
+/// The keyboard stays where it is: the editor may be one not in view.
 fn replace_text(
     editor: &Entity<EditorState>,
     before: &str,
@@ -882,6 +1068,7 @@ fn replace_text(
     window: &mut Window,
     cx: &mut App,
 ) {
+    use gpui_kit::component::RopeExt as _;
     if before == after {
         return;
     }
@@ -892,7 +1079,8 @@ fn replace_text(
         if *editor.text() != after {
             editor.set_value(after.to_string(), window, cx);
         }
-        editor.set_cursor_position(caret, window, cx);
+        let offset = editor.text().position_to_offset(&caret);
+        editor.set_selected_range(offset..offset, cx);
     });
 }
 

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
@@ -43,6 +43,12 @@ pub(super) enum Mode {
     Text,
     /// Usages found beforehand; typing narrows them.
     Usages,
+    /// The declarations of the open file.
+    Outline,
+    /// The files opened last.
+    Recent,
+    /// Compile errors and vet findings.
+    Problems,
 }
 
 pub(super) struct Palette {
@@ -54,20 +60,36 @@ pub(super) struct Palette {
     /// Every usage, for [`Mode::Usages`].
     pub found: Vec<Hit>,
     pub selected: usize,
-    scroll: ScrollHandle,
+    pub scroll: ScrollHandle,
     /// The search in flight; replacing it abandons the previous one.
     search: Task<()>,
     cancelled: Arc<AtomicBool>,
     _subscription: Subscription,
 }
 
+/// Two taps of Shift, as in GoLand, open the file search.
+#[derive(Default)]
+pub(super) struct ShiftTaps {
+    /// When Shift went down alone.
+    pressed: Option<Instant>,
+    /// When the last tap ended, if nothing else was pressed since.
+    last: Option<Instant>,
+}
+
+/// A tap is a short press, and two taps are close together.
+const TAP: Duration = Duration::from_millis(350);
+const BETWEEN_TAPS: Duration = Duration::from_millis(450);
+
 impl Workspace {
     pub(super) fn open_palette(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(match mode {
-                Mode::Files => "按文件名查找",
+                Mode::Files => "按文件名查找，也可以粘贴 kafka/consumer.go:159",
                 Mode::Text => "在所有文件中查找文字",
                 Mode::Usages => "筛选",
+                Mode::Outline => "按名称筛选",
+                Mode::Recent => "按文件名筛选",
+                Mode::Problems => "筛选",
             })
         });
         let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
@@ -111,14 +133,15 @@ impl Workspace {
         };
         let query = palette.input.read(cx).value().to_string();
         let mode = palette.mode;
-        if mode == Mode::Usages {
+        if matches!(mode, Mode::Usages | Mode::Outline | Mode::Recent | Mode::Problems) {
             let query = query.to_lowercase();
             palette.hits = palette
                 .found
                 .iter()
                 .filter(|hit| {
-                    hit.path.to_lowercase().contains(&query)
-                        || hit.preview.to_lowercase().contains(&query)
+                    let path = matches!(mode, Mode::Usages | Mode::Recent | Mode::Problems)
+                        && hit.path.to_lowercase().contains(&query);
+                    path || hit.preview.to_lowercase().contains(&query)
                 })
                 .cloned()
                 .collect();
@@ -145,7 +168,9 @@ impl Workspace {
                 let files =
                     known.unwrap_or_else(|| Arc::new(finder::project_files(&root, &hidden)));
                 let hits = match mode {
-                    Mode::Files | Mode::Usages => finder::find_files(&files, &query, MAX_RESULTS),
+                    Mode::Files | Mode::Usages | Mode::Outline | Mode::Recent | Mode::Problems => {
+                        finder::find_files(&files, &query, MAX_RESULTS)
+                    }
                     Mode::Text => {
                         finder::find_text(&root, &files, &query, MAX_RESULTS, &cancelled)
                     }
@@ -186,13 +211,55 @@ impl Workspace {
             return;
         };
         let (path, row, col) = (self.root.join(&hit.path), hit.row, hit.col);
-        let text = self.palette.as_ref().is_some_and(|p| p.mode != Mode::Files);
+        // A file found with a line, as `consumer.go:159`, opens at that line.
+        let text = self
+            .palette
+            .as_ref()
+            .is_some_and(|p| !matches!(p.mode, Mode::Files | Mode::Recent))
+            || !hit.preview.is_empty();
         self.close_palette(window, cx);
         if text {
             self.open_at(path, row, col, window, cx);
         } else {
             self.open(path, window, cx);
         }
+    }
+
+    pub(super) fn shift_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = event.modifiers;
+        let others = modifiers.control || modifiers.alt || modifiers.platform || modifiers.function;
+        let taps = &mut self.shift_taps;
+        if modifiers.shift && !others {
+            taps.pressed = Some(Instant::now());
+            return;
+        }
+        let tapped = !modifiers.shift
+            && !others
+            && taps.pressed.take().is_some_and(|pressed| pressed.elapsed() < TAP);
+        if !tapped {
+            taps.pressed = None;
+            taps.last = None;
+            return;
+        }
+        if taps.last.take().is_some_and(|last| last.elapsed() < BETWEEN_TAPS) {
+            if self.palette.as_ref().is_some_and(|palette| palette.mode == Mode::Files) {
+                self.close_palette(window, cx);
+            } else {
+                self.open_palette(Mode::Files, window, cx);
+            }
+        } else {
+            taps.last = Some(Instant::now());
+        }
+    }
+
+    /// Any key between the taps makes them not a double tap.
+    pub(super) fn shift_key_down(&mut self, _: &KeyDownEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.shift_taps = ShiftTaps::default();
     }
 
     pub(super) fn on_find_file(&mut self, _: &FindFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -246,9 +313,12 @@ impl Workspace {
                 None => ("", hit.path.as_str()),
             };
             let (title, detail) = match palette.mode {
-                Mode::Files => (name.to_string(), folder.to_string()),
+                Mode::Files | Mode::Recent => (format!("{name}{}", hit.preview), folder.to_string()),
                 Mode::Text => (hit.preview.clone(), format!("{name}:{}", hit.row + 1)),
-                Mode::Usages => (hit.preview.clone(), format!("{}:{}", hit.path, hit.row + 1)),
+                Mode::Usages | Mode::Problems => {
+                    (hit.preview.clone(), format!("{}:{}", hit.path, hit.row + 1))
+                }
+                Mode::Outline => (hit.preview.clone(), hit.detail.clone()),
             };
             h_flex()
                 .id(("palette-row", ix))
@@ -277,7 +347,7 @@ impl Workspace {
                         .flex_shrink_0()
                         .max_w(px(420.))
                         .truncate()
-                        .when(palette.mode == Mode::Usages, |title| {
+                        .when(!matches!(palette.mode, Mode::Files | Mode::Recent), |title| {
                             title.font_family(theme.mono_font_family.clone())
                         })
                         .child(title),
@@ -289,7 +359,7 @@ impl Workspace {
                         .truncate()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .when(palette.mode != Mode::Files, |detail| detail.text_right())
+                        .when(!matches!(palette.mode, Mode::Files | Mode::Recent), |detail| detail.text_right())
                         .child(detail),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -319,6 +389,9 @@ impl Workspace {
                             Mode::Files => "file-search",
                             Mode::Text => "search",
                             Mode::Usages => "list-tree",
+                            Mode::Outline => "list",
+                            Mode::Recent => "clock",
+                            Mode::Problems => "circle-alert",
                         })
                         .small()
                         .text_color(theme.muted_foreground),

@@ -1,6 +1,6 @@
 [package]
 name = "gust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A lightweight Go IDE for the AI coding era"
 
@@ -30,6 +30,7 @@ markdown = "1"
 similar = "2.7"
 tree-sitter = "0.26"
 tree-sitter-go = "0.23"
+trash = "5"
 
 [build-dependencies]
 embed-resource = "3"

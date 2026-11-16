@@ -18,6 +18,8 @@ pub struct Hit {
     pub preview: String,
     /// A label shown with the row, such as "实现" for an implementation.
     pub tag: &'static str,
+    /// More about the row, such as a declaration's signature.
+    pub detail: String,
 }
 
 /// Every file in the project that is not ignored by git or hidden by the
@@ -91,18 +93,101 @@ fn score(path: &str, query: &str) -> Option<i32> {
     Some(score - path.len() as i32 / 4)
 }
 
+/// A `line` or `line:column` after the last colon of `word`: zero-based.
+fn line_and_column(word: &str) -> Option<(&str, u32, u32)> {
+    let word = word.trim_end_matches([')', ',', '.', ';', '\'', '"']);
+    let number = |text: &str| -> Option<u32> {
+        (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
+    };
+    let (rest, last) = word.rsplit_once(':')?;
+    let last = number(last)?;
+    if let Some((path, line)) = rest.rsplit_once(':')
+        && let Some(line) = number(line)
+        && !path.is_empty()
+    {
+        return Some((path, line.saturating_sub(1), last.saturating_sub(1)));
+    }
+    (!rest.is_empty()).then(|| (rest, last.saturating_sub(1), 0))
+}
+
+/// A query as found in logs and stack traces, `kafka/consumer.go:159` or
+/// `/app/kafka/consumer.go:159 +0x1d`: the path, and the line to go to.
+pub fn split_location(query: &str) -> (String, Option<(u32, u32)>) {
+    for word in query.split_whitespace() {
+        // A drive letter alone is not a path with a line.
+        if let Some((path, row, col)) = line_and_column(word)
+            && path.len() > 1
+        {
+            return (path.replace('\\', "/"), Some((row, col)));
+        }
+    }
+    (query.split_whitespace().collect(), None)
+}
+
+/// Files whose path ends the way `query` does, most folders in common first.
+fn by_suffix<'a>(files: &'a [String], query: &str) -> Vec<&'a String> {
+    let wanted: Vec<&str> = query
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let Some(name) = wanted.last() else {
+        return Vec::new();
+    };
+    let mut ranked: Vec<(usize, &String)> = files
+        .iter()
+        .filter_map(|path| {
+            let parts: Vec<&str> = path.split('/').collect();
+            if !parts.last()?.eq_ignore_ascii_case(name) {
+                return None;
+            }
+            let common = parts
+                .iter()
+                .rev()
+                .zip(wanted.iter().rev())
+                .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+                .count();
+            Some((common, path))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
+    let best = ranked.first().map_or(0, |(common, _)| *common);
+    // With folders in common, only the files that share the most of them.
+    ranked
+        .into_iter()
+        .filter(|(common, _)| best <= 1 || *common == best)
+        .map(|(_, path)| path)
+        .collect()
+}
+
 /// The `limit` files that best answer `query`; with no query, the first files.
+///
+/// A query with a line, such as `kafka/consumer.go:159`, finds the file by
+/// how its path ends and puts the line on each result.
 pub fn find_files(files: &[String], query: &str, limit: usize) -> Vec<Hit> {
-    let query: String = query.split_whitespace().collect();
-    let hit = |path: &String| Hit {
-        path: path.clone(),
-        row: 0,
-        col: 0,
-        preview: String::new(),
-        tag: "",
+    let (query, location) = split_location(query);
+    let query = query.trim_start_matches("./").to_string();
+    let hit = |path: &String| {
+        let (row, col) = location.unwrap_or((0, 0));
+        Hit {
+            path: path.clone(),
+            row,
+            col,
+            // Shown after the name: the line it opens at.
+            preview: location.map_or(String::new(), |(row, _)| format!(":{}", row + 1)),
+            tag: "",
+            detail: String::new(),
+        }
     };
     if query.is_empty() {
         return files.iter().take(limit).map(hit).collect();
+    }
+    if query.contains('/') || location.is_some() {
+        let found = by_suffix(files, &query);
+        if !found.is_empty() {
+            return found.into_iter().take(limit).map(hit).collect();
+        }
     }
     let mut ranked: Vec<(i32, &String)> = files
         .iter()
@@ -165,6 +250,7 @@ pub fn find_text(
                 col: col as u32,
                 preview: line.trim().chars().take(160).collect(),
                 tag: "",
+                detail: String::new(),
             });
             if hits.len() >= limit {
                 break;
@@ -177,6 +263,50 @@ pub fn find_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_with_a_line_finds_the_file_by_its_ending() {
+        let files: Vec<String> = [
+            "internal/kafka/consumer.go",
+            "internal/rabbit/consumer.go",
+            "cmd/kafka/main.go",
+        ]
+        .map(String::from)
+        .to_vec();
+        let found = |query: &str| -> Vec<(String, u32, u32)> {
+            find_files(&files, query, 10)
+                .into_iter()
+                .map(|hit| (hit.path, hit.row, hit.col))
+                .collect()
+        };
+        let kafka = ("internal/kafka/consumer.go".to_string(), 158, 0);
+        assert_eq!(found("kafka/consumer.go:159"), [kafka.clone()]);
+        // A server's own absolute path, as in a Go panic.
+        assert_eq!(found("\t/app/internal/kafka/consumer.go:159 +0x1d"), [kafka.clone()]);
+        assert_eq!(
+            found(r"internal\kafka\consumer.go:159:7"),
+            [("internal/kafka/consumer.go".to_string(), 158, 6)]
+        );
+        // Only the name: every file of that name.
+        assert_eq!(found("consumer.go:3").len(), 2);
+        // Without a line, the usual loose search.
+        assert_eq!(found("kafmain")[0].0, "cmd/kafka/main.go");
+    }
+
+    #[test]
+    fn locations_are_read_from_log_lines() {
+        assert_eq!(
+            split_location("kafka/consumer.go:159"),
+            ("kafka/consumer.go".into(), Some((158, 0)))
+        );
+        assert_eq!(split_location("at main.go:12:5,"), ("main.go".into(), Some((11, 4))));
+        assert_eq!(
+            split_location(r"C:\work\main.go:3"),
+            ("C:/work/main.go".into(), Some((2, 0)))
+        );
+        assert_eq!(split_location("consumer"), ("consumer".into(), None));
+    }
+
 
     fn names(hits: Vec<Hit>) -> Vec<String> {
         hits.into_iter().map(|hit| hit.path).collect()

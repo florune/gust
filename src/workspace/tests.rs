@@ -393,14 +393,14 @@ fn the_terminal_keeps_its_keys_from_the_editor(cx: &mut TestAppContext) {
     fixture.press("ctrl-`", cx);
     assert_eq!(state(cx), (true, 1, 1));
 
-    // Ctrl+W erases a word in the shell; it must not close the editor tab.
+    // Ctrl+W erases a word in the shell; it must not reach the editor.
     fixture.press("ctrl-w", cx);
     assert_eq!(state(cx), (true, 1, 1));
 
     fixture.press("ctrl-`", cx);
     assert_eq!(state(cx), (false, 1, 1));
     // Back in the editor, the same key closes the tab again.
-    fixture.press("ctrl-w", cx);
+    fixture.press("ctrl-f4", cx);
     assert_eq!(state(cx), (false, 1, 0));
 }
 
@@ -473,8 +473,8 @@ fn a_changed_file_opens_as_a_diff(cx: &mut TestAppContext) {
     });
     assert_eq!((active, added, removed), (true, 2, 1));
 
-    // Ctrl+W closes the diff, not the file behind it.
-    fixture.press("ctrl-w", cx);
+    // Closing the tab closes the diff, not the file behind it.
+    fixture.press("ctrl-f4", cx);
     let (diff_open, files_open) = fixture
         .workspace
         .read_with(cx, |workspace, _| (workspace.diff.is_some(), workspace.docs.len()));
@@ -500,17 +500,153 @@ fn a_file_changed_on_disk_is_reloaded_unless_it_has_unsaved_edits(cx: &mut TestA
     assert_eq!(fixture.text(cx), "one\ntwo\nthree\n");
     assert!(!fixture.dirty(cx));
 
-    // With unsaved edits, the editor keeps them and says so.
+    // With unsaved edits, the editor keeps them and asks which to keep.
     fixture.set_cursor(0, 3, cx);
     fixture.input("!", cx);
     std::fs::write(fixture.root.join("notes.md"), "replaced\n").unwrap();
     changed(cx);
     assert_eq!(fixture.text(cx), "one!\ntwo\nthree\n");
     assert!(fixture.dirty(cx));
-    let notice = fixture
-        .workspace
-        .read_with(cx, |workspace, _| workspace.notice.clone());
-    assert!(notice.is_some());
+    assert_eq!(fixture.conflict(cx).as_deref(), Some("replaced\n"));
+}
+
+impl Fixture {
+    /// The disk's text of the active file, when it conflicts with the edits.
+    fn conflict(&self, cx: &mut TestAppContext) -> Option<String> {
+        self.workspace.read_with(cx, |workspace, _| {
+            workspace.docs[workspace.active.unwrap()].conflict.clone()
+        })
+    }
+
+    fn files_changed(&self, cx: &mut TestAppContext) {
+        cx.update_window(self.window.into(), |_, window, cx| {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.files_changed(window, cx));
+        })
+        .unwrap();
+        self.settle(cx);
+    }
+
+    fn update(&self, cx: &mut TestAppContext, f: impl FnOnce(&mut Workspace, &mut gpui_kit::Window, &mut gpui_kit::Context<Workspace>)) {
+        cx.update_window(self.window.into(), |_, window, cx| {
+            self.workspace.update(cx, |workspace, cx| f(workspace, window, cx));
+        })
+        .unwrap();
+        self.settle(cx);
+    }
+
+    /// Edit the open file, then have something else rewrite it on disk.
+    fn make_conflict(&self, disk: &str, cx: &mut TestAppContext) {
+        self.set_cursor(0, 3, cx);
+        self.input("!", cx);
+        std::fs::write(self.root.join("notes.md"), disk).unwrap();
+        self.files_changed(cx);
+    }
+}
+
+#[gpui_kit::test]
+fn a_conflict_is_never_saved_over_until_a_side_is_picked(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "conflict-wait", &[("notes.md", "one\ntwo\n")], "notes.md");
+    fixture.make_conflict("one\nTWO\n", cx);
+
+    // Saving everything, as switching to the terminal does, leaves it alone;
+    // so does closing the tab.
+    fixture.update(cx, |workspace, _, cx| workspace.save_all(cx));
+    fixture.press("ctrl-f4", cx);
+    assert_eq!(std::fs::read_to_string(fixture.root.join("notes.md")).unwrap(), "one\nTWO\n");
+    assert_eq!(fixture.tabs(cx), ["notes.md"]);
+
+    // Ctrl+S on purpose keeps the edits.
+    fixture.press("ctrl-s", cx);
+    assert_eq!(std::fs::read_to_string(fixture.root.join("notes.md")).unwrap(), "one!\ntwo\n");
+    assert_eq!(fixture.conflict(cx), None);
+}
+
+#[gpui_kit::test]
+fn taking_the_disk_version_drops_the_edits(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "conflict-disk", &[("notes.md", "one\ntwo\n")], "notes.md");
+    fixture.make_conflict("one\nTWO\n", cx);
+    fixture.update(cx, |workspace, window, cx| workspace.take_disk(0, window, cx));
+    assert_eq!(fixture.text(cx), "one\nTWO\n");
+    assert!(!fixture.dirty(cx));
+    assert_eq!(fixture.conflict(cx), None);
+}
+
+#[gpui_kit::test]
+fn the_disk_compare_takes_changes_one_block_at_a_time(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "conflict-compare",
+        &[("notes.md", "one\ntwo\nthree\nfour\n")],
+        "notes.md",
+    );
+    // The disk changed two lines; the editor changed the first. The first
+    // two lines make one block, the last line another.
+    fixture.make_conflict("one\nTWO\nthree\nFOUR\n", cx);
+    fixture.update(cx, |workspace, window, cx| workspace.compare_with_disk(0, window, cx));
+    let sides = |cx: &mut TestAppContext| {
+        fixture.workspace.read_with(cx, |workspace, cx| {
+            let (left, right) = workspace.diff.as_ref().unwrap().sides().expect("both sides read");
+            (left.read(cx).text().to_string(), right.read(cx).text().to_string())
+        })
+    };
+    assert_eq!(
+        sides(cx),
+        ("one\nTWO\nthree\nFOUR\n".to_string(), "one!\ntwo\nthree\nfour\n".to_string())
+    );
+
+    // Take the disk's last block: the edit to the first line stays.
+    fixture.update(cx, |workspace, window, cx| workspace.take_disk_chunk(1, window, cx));
+    assert_eq!(fixture.text(cx), "one!\ntwo\nthree\nFOUR\n");
+    assert_eq!(sides(cx).1, "one!\ntwo\nthree\nFOUR\n");
+    assert!(fixture.conflict(cx).is_some());
+
+    // Taking the rest leaves nothing to decide, and the compare closes.
+    fixture.update(cx, |workspace, window, cx| workspace.take_disk_chunk(0, window, cx));
+    assert_eq!(fixture.text(cx), "one\nTWO\nthree\nFOUR\n");
+    assert_eq!(fixture.conflict(cx), None);
+    assert!(!fixture.dirty(cx));
+}
+
+#[gpui_kit::test]
+fn the_outline_lists_the_file_and_starts_at_the_caret(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "outline",
+        &[
+            GO_MOD,
+            (
+                "main.go",
+                "package main\n\ntype Room struct {\n\tChips int\n}\n\nfunc (r *Room) Add(n int) {\n\tr.Chips += n\n}\n\nfunc main() {\n}\n",
+            ),
+        ],
+        "main.go",
+    );
+    fixture.set_cursor(7, 2, cx);
+    let symbol = fixture.workspace.read_with(cx, |workspace, cx| workspace.current_symbol(cx));
+    assert_eq!(symbol.as_deref(), Some("Room.Add"));
+
+    fixture.press("ctrl-f12", cx);
+    let (rows, selected) = fixture.workspace.read_with(cx, |workspace, _| {
+        let palette = workspace.palette.as_ref().expect("the outline is open");
+        let rows: Vec<(String, &str)> =
+            palette.hits.iter().map(|hit| (hit.preview.clone(), hit.tag)).collect();
+        (rows, palette.selected)
+    });
+    assert_eq!(
+        rows,
+        [
+            ("Room".to_string(), "类型"),
+            ("    Chips".to_string(), "字段"),
+            ("Room.Add".to_string(), "方法"),
+            ("main".to_string(), "函数"),
+        ]
+    );
+    assert_eq!(selected, 2);
+
+    fixture.input("mai", cx);
+    fixture.press("enter", cx);
+    assert_eq!(fixture.cursor(cx), (10, 5));
 }
 
 #[gpui_kit::test]
@@ -1090,7 +1226,7 @@ fn closing_a_tab_keeps_unsaved_edits(cx: &mut TestAppContext) {
     fixture.input("!", cx);
     assert!(fixture.dirty(cx));
 
-    fixture.press("ctrl-w", cx);
+    fixture.press("ctrl-f4", cx);
 
     assert_eq!(fixture.on_disk("notes.md"), "one!\n");
     let open = fixture
@@ -1274,4 +1410,501 @@ fn a_running_program_can_be_stopped(cx: &mut TestAppContext) {
     fixture.press("ctrl-f2", cx);
     assert_eq!(run_phase(&fixture, cx), super::run_panel::Phase::Stopped);
     assert!(console_text(&fixture, cx).ends_with("已停止"));
+}
+
+#[gpui_kit::test]
+fn the_caret_line_says_who_changed_it_last(cx: &mut TestAppContext) {
+    let fixture = Fixture::in_repository(cx, "blame", &[("notes.md", "one\ntwo\n")], "notes.md");
+    let note = |cx: &mut TestAppContext| {
+        fixture.workspace.read_with(cx, |workspace, cx| {
+            workspace.blame_note(0, cx).map(|note| note.to_string())
+        })
+    };
+    // The git status arrives in the background, then the blame.
+    fixture.settle(cx);
+    fixture.settle(cx);
+    let committed = note(cx).expect("the line is blamed");
+    assert!(committed.starts_with("Test, "), "{committed}");
+    assert!(committed.ends_with("· first"), "{committed}");
+
+    // An edited line has no commit yet; the blame is read again once typing pauses.
+    fixture.set_cursor(1, 3, cx);
+    fixture.input("!", cx);
+    cx.executor().advance_clock(std::time::Duration::from_millis(600));
+    fixture.settle(cx);
+    assert_eq!(note(cx).as_deref(), Some("你 · 未提交的修改"));
+    fixture.set_cursor(0, 0, cx);
+    assert!(note(cx).unwrap().starts_with("Test, "));
+}
+
+#[gpui_kit::test]
+fn a_split_shows_the_same_file_twice_and_keeps_both_in_step(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "split", &[("a.md", "one\n"), ("b.md", "bee\n")], "a.md");
+    fixture.press("ctrl-b", cx); // nothing to go to; the editor keeps the keys
+    fixture.update(cx, |workspace, window, cx| workspace.on_split_right(&super::split::SplitRight, window, cx));
+    let right = fixture.workspace.read_with(cx, |workspace, _| {
+        workspace.split.as_ref().expect("split").editor.clone()
+    });
+
+    // Typing on the right edits the file.
+    fixture.input("1", cx);
+    assert_eq!(right.read_with(cx, |editor, _| editor.text().to_string()), "1one\n");
+    assert_eq!(fixture.text(cx), "1one\n");
+    assert!(fixture.dirty(cx));
+
+    // A file opened now goes to the right pane; the left keeps its file.
+    fixture.open_file("b.md", cx);
+    let (left, right_path) = fixture.workspace.read_with(cx, |workspace, _| {
+        let left = workspace.docs[workspace.active.unwrap()].title.to_string();
+        let right = workspace.split.as_ref().unwrap().path.clone();
+        (left, right)
+    });
+    assert_eq!(left, "a.md");
+    assert_eq!(right_path, fixture.root.join("b.md"));
+
+    // Closing a tab in the right pane closes the pane, not a tab.
+    fixture.press("ctrl-f4", cx);
+    let state = fixture
+        .workspace
+        .read_with(cx, |workspace, _| (workspace.split.is_some(), workspace.docs.len()));
+    assert_eq!(state, (false, 2));
+}
+
+#[gpui_kit::test]
+fn editing_the_left_pane_shows_on_the_right(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "split-left", &[("a.md", "one\n")], "a.md");
+    fixture.update(cx, |workspace, window, cx| {
+        let path = workspace.docs[0].path.clone();
+        workspace.split_right(&path, window, cx);
+        // Back to the left pane.
+        workspace.activate(0, window, cx);
+    });
+    assert!(!fixture.workspace.read_with(cx, |workspace, _| workspace.split_focused()));
+    fixture.set_cursor(0, 3, cx);
+    fixture.input("!", cx);
+    let right = fixture.workspace.read_with(cx, |workspace, cx| {
+        workspace.split.as_ref().unwrap().editor.read(cx).text().to_string()
+    });
+    assert_eq!(right, "one!\n");
+
+    // Closing the file's tab closes the pane that shows it.
+    fixture.press("ctrl-f4", cx);
+    assert!(fixture.workspace.read_with(cx, |workspace, _| workspace.split.is_none()));
+}
+
+impl Fixture {
+    /// The middle of the text at byte `range` of the active editor, on screen.
+    fn point_of(&self, range: std::ops::Range<usize>, cx: &mut TestAppContext) -> gpui_kit::Point<gpui_kit::Pixels> {
+        self.settle(cx);
+        let bounds = self
+            .editor(cx)
+            .read_with(cx, |editor, _| editor.range_to_bounds(&range))
+            .expect("the text is laid out");
+        bounds.center()
+    }
+
+    fn mouse(&self, event: gpui_kit::PlatformInput, cx: &mut TestAppContext) {
+        cx.update_window(self.window.into(), |_, window, cx| {
+            window.dispatch_event(event, cx);
+        })
+        .unwrap();
+        self.settle(cx);
+    }
+
+    /// Press and release the left button at `at` with `modifiers`, optionally
+    /// dragging to `to` in between.
+    fn click(
+        &self,
+        at: gpui_kit::Point<gpui_kit::Pixels>,
+        to: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+        modifiers: gpui_kit::Modifiers,
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+        self.mouse(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        let end = to.unwrap_or(at);
+        if to.is_some() {
+            self.mouse(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: end,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers,
+                }),
+                cx,
+            );
+        }
+        self.mouse(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: end,
+                modifiers,
+                click_count: 1,
+            }),
+            cx,
+        );
+    }
+}
+
+fn definition_project(cx: &mut TestAppContext, name: &str) -> Fixture {
+    Fixture::new(
+        cx,
+        name,
+        &[
+            GO_MOD,
+            ("util.go", "package main\n\n// helper helps.\nfunc helper() {}\n"),
+            ("main.go", "package main\n\nfunc main() {\n\thelper()\n}\n"),
+        ],
+        "main.go",
+    )
+}
+
+#[gpui_kit::test]
+fn ctrl_click_goes_to_the_definition_without_hovering_first(cx: &mut TestAppContext) {
+    let fixture = definition_project(cx, "ctrl-click");
+    let source = fixture.text(cx);
+    let at = source.find("helper()").unwrap();
+    let point = fixture.point_of(at + 2..at + 3, cx);
+    fixture.click(point, None, gpui_kit::Modifiers::control(), cx);
+    assert_eq!(fixture.active_file(cx), "util.go");
+    assert_eq!(fixture.cursor(cx), (3, 5));
+}
+
+#[gpui_kit::test]
+fn back_and_forward_return_across_a_jump(cx: &mut TestAppContext) {
+    let fixture = definition_project(cx, "back");
+    fixture.set_cursor(3, 3, cx);
+    fixture.press("ctrl-b", cx);
+    assert_eq!(fixture.active_file(cx), "util.go");
+
+    fixture.press("ctrl-alt-left", cx);
+    assert_eq!(fixture.active_file(cx), "main.go");
+    assert_eq!(fixture.cursor(cx), (3, 3));
+
+    fixture.press("ctrl-alt-right", cx);
+    assert_eq!(fixture.active_file(cx), "util.go");
+    assert_eq!(fixture.cursor(cx), (3, 5));
+}
+
+#[gpui_kit::test]
+fn alt_drag_selects_a_block_and_alt_shift_click_adds_a_caret(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "alt-mouse", &[("a.txt", "abcd\nefgh\nijkl\n")], "a.txt");
+    // Alt+drag from before "b" to after "f": the first column of two lines.
+    let from = fixture.point_of(1..1, cx);
+    let to = fixture.point_of(7..7, cx);
+    fixture.click(from, Some(to), gpui_kit::Modifiers::alt(), cx);
+    fixture.input("X", cx);
+    assert_eq!(fixture.text(cx), "aXcd\neXgh\nijkl\n");
+
+    // Alt+Shift+click puts a second caret where it clicks.
+    fixture.set_cursor(2, 0, cx);
+    let other = fixture.point_of(4..4, cx);
+    let mut alt_shift = gpui_kit::Modifiers::alt();
+    alt_shift.shift = true;
+    fixture.click(other, None, alt_shift, cx);
+    fixture.input("!", cx);
+    assert_eq!(fixture.text(cx), "aXcd!\neXgh\n!ijkl\n");
+}
+
+#[gpui_kit::test]
+fn ctrl_w_grows_the_selection_and_ctrl_shift_w_shrinks_it(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "extend",
+        &[GO_MOD, ("main.go", "package main
+
+func main() {
+	println(1, 22)
+}
+")],
+        "main.go",
+    );
+    let selected = |cx: &mut TestAppContext| {
+        fixture.editor(cx).read_with(cx, |editor, _| editor.selected_text().to_string())
+    };
+    fixture.set_cursor(3, 13, cx);
+    fixture.press("ctrl-w", cx);
+    assert_eq!(selected(cx), "22");
+    fixture.press("ctrl-w", cx);
+    assert_eq!(selected(cx), "1, 22");
+    fixture.press("ctrl-w", cx);
+    assert_eq!(selected(cx), "(1, 22)");
+    fixture.press("ctrl-shift-w", cx);
+    assert_eq!(selected(cx), "1, 22");
+    fixture.press("ctrl-shift-w", cx);
+    assert_eq!(selected(cx), "22");
+    // The tab is still there: Ctrl+W no longer closes it.
+    assert_eq!(fixture.tabs(cx), ["main.go"]);
+}
+
+impl Fixture {
+    fn modifiers(&self, modifiers: gpui_kit::Modifiers, cx: &mut TestAppContext) {
+        self.mouse(
+            gpui_kit::PlatformInput::ModifiersChanged(gpui_kit::ModifiersChangedEvent {
+                modifiers,
+                capslock: Default::default(),
+            }),
+            cx,
+        );
+    }
+
+    fn tap_shift(&self, cx: &mut TestAppContext) {
+        self.modifiers(gpui_kit::Modifiers::shift(), cx);
+        self.modifiers(gpui_kit::Modifiers::default(), cx);
+    }
+}
+
+#[gpui_kit::test]
+fn double_shift_opens_the_file_search_and_a_line_opens_at_it(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "double-shift",
+        &[
+            ("internal/kafka/consumer.go", "package kafka\n\nfunc a() {}\n\nfunc b() {}\n"),
+            ("internal/rabbit/consumer.go", "package rabbit\n"),
+            ("main.go", "package main\n"),
+        ],
+        "main.go",
+    );
+    // One tap does nothing; a key between taps cancels them.
+    fixture.tap_shift(cx);
+    fixture.press("a", cx);
+    fixture.tap_shift(cx);
+    assert!(fixture.workspace.read_with(cx, |workspace, _| workspace.palette.is_none()));
+
+    fixture.tap_shift(cx);
+    fixture.tap_shift(cx);
+    assert!(fixture.workspace.read_with(cx, |workspace, _| workspace.palette.is_some()));
+
+    fixture.input("kafka/consumer.go:5", cx);
+    fixture.press("enter", cx);
+    assert_eq!(fixture.active_file(cx), "internal/kafka/consumer.go");
+    assert_eq!(fixture.cursor(cx), (4, 0));
+}
+
+
+#[gpui_kit::test]
+fn files_are_made_renamed_and_deleted_from_the_tree(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "file-ops", &[GO_MOD, ("main.go", "package main\n")], "main.go");
+    let root = fixture.root.clone();
+    let prompt = |action: super::file_ops::FileAction, cx: &mut TestAppContext| {
+        fixture.update(cx, |workspace, window, cx| workspace.open_file_prompt(action, window, cx));
+    };
+
+    // A new Go file in a new folder starts with that folder's package.
+    prompt(super::file_ops::FileAction::New { dir: root.clone(), folder: false }, cx);
+    fixture.input("api/h.go", cx);
+    fixture.press("enter", cx);
+    assert_eq!(std::fs::read_to_string(root.join("api/h.go")).unwrap(), "package api\n\n");
+    assert_eq!(fixture.active_file(cx), "api/h.go");
+
+    // Renaming starts with the name selected without its extension.
+    prompt(super::file_ops::FileAction::Rename(root.join("api/h.go")), cx);
+    fixture.input("handler", cx);
+    fixture.press("enter", cx);
+    assert!(root.join("api/handler.go").is_file() && !root.join("api/h.go").exists());
+    assert_eq!(fixture.active_file(cx), "api/handler.go");
+
+    // A name that is taken is refused, and the box says why.
+    prompt(super::file_ops::FileAction::New { dir: root.clone(), folder: false }, cx);
+    fixture.input("main.go", cx);
+    fixture.press("enter", cx);
+    let error = fixture.workspace.read_with(cx, |workspace, _| {
+        workspace.file_prompt.as_ref().and_then(|prompt| prompt.error.clone())
+    });
+    assert!(error.is_some());
+    fixture.press("escape", cx);
+
+    // Deleting a folder closes what was open from it.
+    prompt(super::file_ops::FileAction::Delete(root.join("api")), cx);
+    fixture.press("enter", cx);
+    assert!(!root.join("api").exists());
+    assert_eq!(fixture.tabs(cx), ["main.go"]);
+}
+
+#[gpui_kit::test]
+fn goland_editing_keys_work_on_lines(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "editing-keys",
+        &[GO_MOD, ("main.go", "package main\n\nfunc main() {\n\ta()\n\tb()\n}\n")],
+        "main.go",
+    );
+    fixture.set_cursor(3, 1, cx);
+    fixture.press("ctrl-/", cx);
+    assert_eq!(fixture.text(cx), "package main\n\nfunc main() {\n\t// a()\n\tb()\n}\n");
+    // The caret went on to the next line; comment it back in from there.
+    fixture.set_cursor(3, 1, cx);
+    fixture.press("ctrl-/", cx);
+    assert_eq!(fixture.text(cx), "package main\n\nfunc main() {\n\ta()\n\tb()\n}\n");
+
+    fixture.set_cursor(3, 1, cx);
+    fixture.press("ctrl-d", cx);
+    assert_eq!(fixture.text(cx), "package main\n\nfunc main() {\n\ta()\n\ta()\n\tb()\n}\n");
+    fixture.press("ctrl-y", cx);
+    assert_eq!(fixture.text(cx), "package main\n\nfunc main() {\n\ta()\n\tb()\n}\n");
+
+    fixture.set_cursor(4, 1, cx);
+    fixture.press("ctrl-shift-up", cx);
+    assert_eq!(fixture.text(cx), "package main\n\nfunc main() {\n\tb()\n\ta()\n}\n");
+    assert_eq!(fixture.cursor(cx), (3, 1));
+
+    // Undo takes the move back; Ctrl+Shift+Z puts it in again.
+    fixture.press("ctrl-z", cx);
+    assert_eq!(fixture.text(cx), "package main\n\nfunc main() {\n\ta()\n\tb()\n}\n");
+    fixture.press("ctrl-shift-z", cx);
+    assert_eq!(fixture.text(cx), "package main\n\nfunc main() {\n\tb()\n\ta()\n}\n");
+}
+
+#[gpui_kit::test]
+fn ctrl_e_lists_the_files_shown_last_and_picks_the_one_before(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "recent-files",
+        &[("a.md", "a\n"), ("b.md", "b\n"), ("c.md", "c\n")],
+        "a.md",
+    );
+    fixture.open_file("b.md", cx);
+    fixture.open_file("c.md", cx);
+    fixture.press("ctrl-e", cx);
+    let rows = fixture.workspace.read_with(cx, |workspace, _| {
+        let palette = workspace.palette.as_ref().unwrap();
+        let rows: Vec<String> = palette.hits.iter().map(|hit| hit.path.clone()).collect();
+        (rows, palette.selected)
+    });
+    assert_eq!(rows, (vec!["c.md".into(), "b.md".into(), "a.md".into()], 1));
+    fixture.press("enter", cx);
+    assert_eq!(fixture.active_file(cx), "b.md");
+}
+
+#[gpui_kit::test]
+fn compile_errors_show_in_the_editor_and_f2_goes_to_them(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "problems",
+        &[
+            GO_MOD,
+            (
+                "main.go",
+                "package main\n\nfunc main() {\n\tprintln(1)\n\tprintln(missing)\n}\n",
+            ),
+        ],
+        "main.go",
+    );
+    // The check runs once things settle after opening.
+    cx.executor().advance_clock(std::time::Duration::from_millis(400));
+    fixture.settle(cx);
+    let counts = fixture.workspace.read_with(cx, |workspace, _| workspace.problems.counts());
+    assert_eq!(counts, (1, 0));
+    let underlined = fixture
+        .editor(cx)
+        .read_with(cx, |editor, _| editor.diagnostics().map_or(0, |set| set.len()));
+    assert_eq!(underlined, 1);
+
+    fixture.set_cursor(0, 0, cx);
+    fixture.press("f2", cx);
+    assert_eq!(fixture.cursor(cx), (4, 9));
+
+    // Fixed and saved: the problem goes away.
+    fixture.set_cursor(4, 9, cx);
+    for _ in 0.."missing".len() {
+        fixture.press("delete", cx);
+    }
+    fixture.input("2", cx);
+    fixture.press("ctrl-s", cx);
+    cx.executor().advance_clock(std::time::Duration::from_millis(400));
+    fixture.settle(cx);
+    let counts = fixture.workspace.read_with(cx, |workspace, _| workspace.problems.counts());
+    assert_eq!(counts, (0, 0));
+}
+
+#[gpui_kit::test]
+fn a_changed_block_rolls_back_from_the_keyboard_or_its_mark(cx: &mut TestAppContext) {
+    let fixture = Fixture::in_repository(cx, "rollback-lines", &[("notes.md", "one\ntwo\nthree\n")], "notes.md");
+    fixture.settle(cx);
+    fixture.set_cursor(1, 3, cx);
+    fixture.input("!", cx);
+    assert_eq!(fixture.text(cx), "one\ntwo!\nthree\n");
+
+    fixture.press("ctrl-alt-z", cx);
+    assert_eq!(fixture.text(cx), "one\ntwo\nthree\n");
+
+    // Again, by a click on the mark beside the changed line.
+    fixture.set_cursor(2, 5, cx);
+    fixture.input("?", cx);
+    let (input, top, height) = fixture.editor(cx).read_with(cx, |editor, _| {
+        (editor.input_bounds(), editor.text_bounds().unwrap().top(), editor.line_height().unwrap())
+    });
+    let mark = gpui_kit::point(input.left() + gpui_kit::px(2.), top + height * 2.5);
+    fixture.mouse(
+        gpui_kit::PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
+            button: gpui_kit::MouseButton::Left,
+            position: mark,
+            click_count: 1,
+            ..Default::default()
+        }),
+        cx,
+    );
+    let shown = fixture.workspace.read_with(cx, |workspace, _| {
+        workspace.hunk.as_ref().map(|hunk| hunk.old.clone())
+    });
+    assert_eq!(shown.as_deref(), Some("three\n"));
+    fixture.update(cx, |workspace, window, cx| {
+        let chunk = workspace.hunk.as_ref().unwrap().chunk.clone();
+        workspace.roll_back_for_test(&chunk, window, cx);
+    });
+    assert_eq!(fixture.text(cx), "one\ntwo\nthree\n");
+}
+
+#[gpui_kit::test]
+fn a_whole_file_rolls_back_from_the_commit_panel(cx: &mut TestAppContext) {
+    let fixture = Fixture::in_repository(cx, "rollback-file", &[("notes.md", "one\n")], "notes.md");
+    std::fs::write(fixture.root.join("notes.md"), "changed\n").unwrap();
+    std::fs::write(fixture.root.join("new.md"), "new\n").unwrap();
+    fixture.files_changed(cx);
+    fixture.settle(cx);
+
+    for path in ["notes.md", "new.md"] {
+        fixture.update(cx, |workspace, window, cx| workspace.ask_rollback_file(path.into(), window, cx));
+        fixture.press("enter", cx);
+    }
+    assert_eq!(std::fs::read_to_string(fixture.root.join("notes.md")).unwrap(), "one\n");
+    assert!(!fixture.root.join("new.md").exists());
+    assert_eq!(fixture.text(cx), "one\n");
+    assert!(!fixture.dirty(cx));
+}
+
+#[gpui_kit::test]
+fn a_project_reopens_with_its_tabs_and_carets(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "session",
+        &[("a.md", "one\ntwo\nthree\n"), ("b.md", "bee\n")],
+        "a.md",
+    );
+    fixture.set_cursor(2, 3, cx);
+    fixture.open_file("b.md", cx);
+
+    let other = std::env::temp_dir().join(format!("gust-ui-session-other-{}", std::process::id()));
+    std::fs::create_dir_all(&other).unwrap();
+    let root = fixture.root.clone();
+    fixture.update(cx, |workspace, window, cx| workspace.set_root(other.clone(), window, cx));
+    assert!(fixture.tabs(cx).is_empty());
+
+    fixture.update(cx, |workspace, window, cx| workspace.set_root(root.clone(), window, cx));
+    assert_eq!(fixture.tabs(cx), ["a.md", "b.md"]);
+    assert_eq!(fixture.active_file(cx), "b.md");
+    fixture.press("ctrl-e", cx);
+    fixture.press("enter", cx);
+    assert_eq!(fixture.active_file(cx), "a.md");
+    assert_eq!(fixture.cursor(cx), (2, 3));
+    let _ = std::fs::remove_dir_all(&other);
 }

@@ -641,10 +641,21 @@ impl Workspace {
                 .size_full()
         };
         if doc.language != "markdown" {
-            return div().flex_1().min_h_0().child(editor(&doc.editor)).into_any_element();
+            return div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(editor(&doc.editor))
+                .children(self.render_blame_layer(ix, cx))
+                .into_any_element();
         }
         let body = match doc.view {
-            DocView::Edit => editor(&doc.editor).into_any_element(),
+            DocView::Edit => div()
+                .relative()
+                .size_full()
+                .child(editor(&doc.editor))
+                .children(self.render_blame_layer(ix, cx))
+                .into_any_element(),
             DocView::Preview => self.render_preview(ix, cx),
             DocView::Split => h_flex()
                 .size_full()

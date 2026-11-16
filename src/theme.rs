@@ -323,9 +323,25 @@ pub fn init(mode: ThemeMode, cx: &mut App) {
         theme.dark_theme = dark.into();
         theme.light_theme = light.into();
     });
-    Theme::change(mode, None, cx);
+    change(mode, cx);
     // Scrollbars stay in view, as in GoLand, instead of fading after a scroll.
     Theme::set_scrollbar_mode(gpui_kit::component::scroll::ScrollbarMode::Always, cx);
+}
+
+/// Switch between the dark and the light theme.
+pub fn change(mode: ThemeMode, cx: &mut App) {
+    Theme::change(mode, None, cx);
+    // Loading a theme caps the selection at 30% opacity, which leaves it
+    // faint next to GoLand's; selections are drawn under the text, so a
+    // stronger one hides nothing.
+    Theme::update(cx, |theme| {
+        theme.selection = if theme.is_dark() {
+            Hsla::from(rgb(0x2d5fbf)).opacity(0.5)
+        } else {
+            Hsla::from(rgb(0x3d8ef0)).opacity(0.4)
+        };
+    });
+    cx.refresh_windows();
 }
 
 /// Colors that mean the same thing in both themes: file kinds and git states.

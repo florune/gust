@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod compare;
+mod expand;
 mod complete;
 mod file_tree;
 mod finder;
@@ -9,6 +10,8 @@ mod git;
 mod goindex;
 mod history;
 mod lang;
+mod lines;
+mod problems;
 mod proc;
 mod recent;
 mod run;
@@ -27,7 +30,9 @@ use workspace::Workspace;
 
 fn main() {
     // `gust <folder> [file…]` opens that folder and those files, `gust <file>`
-    // opens the file in its own folder; with no argument, the current folder.
+    // opens the file in its own folder. With no argument, the current folder
+    // when started from a shell in it, or the last project when started by
+    // double-clicking or from a menu.
     let mut args: Vec<PathBuf> = std::env::args()
         .skip(1)
         .map(|arg| absolute(PathBuf::from(arg)))
@@ -35,7 +40,14 @@ fn main() {
     let root = match args.first() {
         Some(first) if first.is_dir() => args.remove(0),
         Some(first) => first.parent().map(PathBuf::from).unwrap_or_default(),
-        None => absolute(PathBuf::from(".")),
+        None => {
+            let here = absolute(PathBuf::from("."));
+            if started_from_a_shell(&here) {
+                here
+            } else {
+                recent::last().unwrap_or(here)
+            }
+        }
     };
     let files = args;
 
@@ -88,4 +100,20 @@ fn absolute(path: PathBuf) -> PathBuf {
         Some(stripped) if !stripped.starts_with("UNC") => PathBuf::from(stripped),
         _ => path,
     }
+}
+
+/// Whether `here`, the current folder, was chosen by whoever started Gust:
+/// a double-click starts it in its own folder, a menu in the system's.
+fn started_from_a_shell(here: &std::path::Path) -> bool {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from));
+    let system = std::env::var_os("SystemRoot").map(PathBuf::from);
+    let same = |dir: &Option<PathBuf>| {
+        dir.as_ref().is_some_and(|dir| {
+            here.to_string_lossy().to_lowercase() == dir.to_string_lossy().to_lowercase()
+                || here.starts_with(dir)
+        })
+    };
+    !same(&exe_dir) && !same(&system)
 }

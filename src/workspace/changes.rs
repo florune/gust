@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{GutterDecoration, Textarea};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -123,7 +123,7 @@ impl Workspace {
     }
 
     /// Path of a file from the repository root, as git names it.
-    fn repo_path(&self, path: &std::path::Path) -> Option<(PathBuf, String)> {
+    pub(super) fn repo_path(&self, path: &std::path::Path) -> Option<(PathBuf, String)> {
         let root = &self.git.as_ref()?.root;
         let relative = path.strip_prefix(root).ok()?;
         Some((root.clone(), relative.to_string_lossy().replace('\\', "/")))
@@ -135,7 +135,9 @@ impl Workspace {
             return;
         };
         let editor = doc.editor.clone();
-        let Some((root, path)) = self.repo_path(&doc.path) else {
+        let file = doc.path.clone();
+        self.refresh_blame(ix, true, cx);
+        let Some((root, path)) = self.repo_path(&file) else {
             self.docs[ix].head = None;
             self.refresh_gutter(ix, cx);
             return;
@@ -355,6 +357,7 @@ impl Workspace {
             .filter(|_| self.diff_active)
             .and_then(|tab| tab.working_path());
 
+        let workspace = cx.entity().downgrade();
         let rows = status
             .changes
             .iter()
@@ -432,6 +435,20 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_diff(Some(path.clone()), window, cx)
                     }))
+                    .context_menu({
+                        let workspace = workspace.clone();
+                        let path = change.path.clone();
+                        move |menu, _, _| {
+                            let workspace = workspace.clone();
+                            let path = path.clone();
+                            menu.item(PopupMenuItem::new("回滚…").on_click(move |_, window, cx| {
+                                let path = path.clone();
+                                workspace
+                                    .update(cx, |this, cx| this.ask_rollback_file(path, window, cx))
+                                    .ok();
+                            }))
+                        }
+                    })
             });
 
         v_flex()
