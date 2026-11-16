@@ -30,6 +30,12 @@ pub(super) enum FileAction {
     Delete(PathBuf),
     /// Take a changed file, from the repository root, back to the last commit.
     Rollback(String),
+    /// Rename a Go symbol everywhere it is used.
+    RenameSymbol(std::sync::Arc<super::rename_symbol::RenamePlan>),
+    /// Make a branch from what is checked out, and switch to it.
+    NewBranch,
+    /// Put the uncommitted changes aside, with a message.
+    Stash,
 }
 
 pub(super) struct FilePrompt {
@@ -95,11 +101,14 @@ impl Workspace {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            FileAction::RenameSymbol(plan) => plan.name.clone(),
             _ => String::new(),
         };
         let placeholder = match &action {
-            FileAction::New { folder: false, .. } => "文件名，如 handler.go 或 api/handler.go",
-            FileAction::New { folder: true, .. } => "文件夹名，如 internal/cache",
+            FileAction::New { folder: false, .. } => "文件名",
+            FileAction::New { folder: true, .. } => "文件夹名",
+            FileAction::NewBranch => "分支名称",
+            FileAction::Stash => "说明（可选）",
             _ => "",
         };
         let input = cx.new(|cx| {
@@ -107,9 +116,13 @@ impl Workspace {
                 .placeholder(placeholder)
                 .default_value(initial.clone())
         });
-        // Renaming selects the name without its extension, as GoLand does.
-        if let Some(stem) = initial.rfind('.').filter(|dot| *dot > 0) {
-            input.update(cx, |input, cx| input.set_selected_range(0..stem, cx));
+        // Renaming selects the name, without the extension of a file.
+        let selected = match &action {
+            FileAction::RenameSymbol(_) => Some(initial.len()),
+            _ => initial.rfind('.').filter(|dot| *dot > 0),
+        };
+        if let Some(end) = selected {
+            input.update(cx, |input, cx| input.set_selected_range(0..end, cx));
         }
         let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -167,6 +180,19 @@ impl Workspace {
             FileAction::Rename(path) => self.rename(&path, &typed, cx),
             FileAction::Delete(path) => self.delete(&path, window, cx),
             FileAction::Rollback(path) => self.rollback_file(&path, window, cx),
+            FileAction::RenameSymbol(plan) => self.apply_rename(&plan, &typed, window, cx),
+            FileAction::NewBranch => {
+                if typed.trim().is_empty() {
+                    Err("请填写分支名称".to_string())
+                } else {
+                    self.create_branch(typed.trim().to_string(), window, cx);
+                    Ok(())
+                }
+            }
+            FileAction::Stash => {
+                self.stash_changes(typed, window, cx);
+                Ok(())
+            }
         };
         match result {
             Ok(()) => {
@@ -195,9 +221,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let path = below(dir, typed).ok_or("名字不能为空，也不能含 ..、: 或以 / 开头")?;
+        let path = below(dir, typed).ok_or("名称无效")?;
         if path.exists() {
-            return Err("已经有这个名字了".into());
+            return Err("名称已存在".into());
         }
         if folder {
             return std::fs::create_dir_all(&path).map_err(|err| format!("无法创建：{err}"));
@@ -220,14 +246,14 @@ impl Workspace {
 
     fn rename(&mut self, from: &Path, typed: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let dir = from.parent().ok_or("无法重命名项目根目录")?;
-        let to = below(dir, typed).ok_or("名字不能为空，也不能含 ..、: 或以 / 开头")?;
+        let to = below(dir, typed).ok_or("名称无效")?;
         if to == from {
             return Ok(());
         }
         // A different case of the same name is the same file on Windows.
         let same_file = to.to_string_lossy().eq_ignore_ascii_case(&from.to_string_lossy());
         if to.exists() && !same_file {
-            return Err("已经有这个名字了".into());
+            return Err("名称已存在".into());
         }
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent).map_err(|err| format!("无法重命名：{err}"))?;
@@ -296,11 +322,27 @@ impl Workspace {
             FileAction::Rename(path) => ("重命名", relative(path), false),
             FileAction::Delete(path) => {
                 let what = if path.is_dir() { "文件夹及其中所有内容" } else { "文件" };
-                ("删除", format!("把{what} {} 移到回收站？", relative(path)), true)
+                ("删除", format!("将{what} {} 移到回收站。", relative(path)), true)
             }
+            FileAction::NewBranch => (
+                "新建分支",
+                format!("基于 {}", self.git.as_ref().map_or(String::new(), |status| status.branch.clone())),
+                false,
+            ),
+            FileAction::Stash => ("暂存改动", "未提交的修改与新文件将被暂存，工作区恢复到上次提交".to_string(), false),
+            FileAction::RenameSymbol(plan) => (
+                "重命名符号",
+                format!(
+                    "{}：{} 处，{} 个文件",
+                    plan.name,
+                    plan.count(),
+                    plan.places.len()
+                ),
+                false,
+            ),
             FileAction::Rollback(path) => (
                 "回滚",
-                format!("把 {path} 恢复成上次提交的样子？没提交的修改会丢掉；上次提交里没有的新文件会移到回收站。"),
+                format!("将 {path} 恢复为上次提交的版本。未提交的修改将丢失，新文件将移到回收站。"),
                 true,
             ),
         };

@@ -1,6 +1,5 @@
-//! Taking changes back to the last commit, as when an AI tool went too far:
-//! a block of lines (click its mark beside the line numbers, or Ctrl+Alt+Z
-//! at the caret), or a whole file from the commit panel.
+//! Rollback to the last commit: a block of changed lines (from its gutter
+//! mark or Ctrl+Alt+Z), or a whole file (from the commit panel).
 
 use std::path::PathBuf;
 
@@ -131,9 +130,9 @@ impl Workspace {
         let colors = crate::theme::palette(cx);
         let start = hunk.chunk.new.start + 1;
         let title = match hunk.chunk.kind {
-            ChunkKind::Added => format!("第 {start} 行起新加了 {} 行", hunk.chunk.new.len()),
-            ChunkKind::Removed => format!("第 {start} 行处删掉了 {} 行", hunk.chunk.old.len()),
-            ChunkKind::Modified => format!("第 {start} 行起改了 {} 行，原来是：", hunk.chunk.new.len()),
+            ChunkKind::Added => format!("第 {start} 行：新增 {} 行", hunk.chunk.new.len()),
+            ChunkKind::Removed => format!("第 {start} 行：删除 {} 行", hunk.chunk.old.len()),
+            ChunkKind::Modified => format!("第 {start} 行：修改 {} 行", hunk.chunk.new.len()),
         };
         let path = hunk.path.clone();
         let chunk = hunk.chunk.clone();
@@ -225,14 +224,18 @@ impl Workspace {
 
     /// Take the file back to the last commit; what was open from it follows.
     pub(super) fn rollback_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
-        let status = self.git.as_ref().ok_or("这个文件夹不是 Git 仓库")?;
+        let status = self.git.as_ref().ok_or("当前文件夹不是 Git 仓库")?;
         let change = status
             .changes
             .iter()
             .find(|change| change.path == path)
             .cloned()
-            .ok_or("这个文件没有改动")?;
+            .ok_or("文件没有改动")?;
         let root = status.root.clone();
+        let file = root.join(&change.path);
+        if let Some(text) = self.docs.iter().find(|doc| doc.path == file).map(|doc| doc.editor.read(cx).text().to_string()).or_else(|| std::fs::read_to_string(&file).ok()) {
+            self.snapshot_before_change(&file, &text, "回滚前");
+        }
         crate::git::rollback(&root, &change)?;
         // Open files take the restored text and drop their unsaved edits.
         for file in [Some(change.path.clone()), change.old_path.clone()].into_iter().flatten() {

@@ -165,7 +165,7 @@ impl Workspace {
     }
 
     /// Any editor shown now, at `position`.
-    fn editor_at(&self, position: Point<Pixels>, cx: &App) -> bool {
+    pub(super) fn editor_at(&self, position: Point<Pixels>, cx: &App) -> bool {
         let shown = self
             .active
             .and_then(|ix| self.docs.get(ix))

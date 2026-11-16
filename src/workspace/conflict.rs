@@ -1,7 +1,6 @@
-//! A file changed on disk while it has unsaved edits, as when an AI tool and
-//! the user edit it at the same time. Nothing is overwritten until the user
-//! decides: keep their edits, take the disk's version, or compare the two and
-//! take the disk's changes block by block.
+//! Conflicts between unsaved edits and a newer version on disk. Neither side
+//! is written over until the user keeps the edits, takes the disk's version,
+//! or merges the two block by block in a compare view.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex};
@@ -116,7 +115,7 @@ impl Workspace {
                         .min_w_0()
                         .truncate()
                         .text_color(theme.foreground)
-                        .child("这个文件在磁盘上被改了（可能是 AI 或其他工具），而你还有没保存的修改。保留哪个？"),
+                        .child("文件已在磁盘上被修改，与未保存的修改冲突。"),
                 )
                 .child(
                     Button::new("conflict-compare")
@@ -130,7 +129,7 @@ impl Workspace {
                 .child(
                     Button::new("conflict-disk")
                         .small()
-                        .label("用磁盘版本")
+                        .label("使用磁盘版本")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.take_disk(ix, window, cx)
                         })),
@@ -138,7 +137,7 @@ impl Workspace {
                 .child(
                     Button::new("conflict-mine")
                         .small()
-                        .label("保留我的")
+                        .label("保留我的修改")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.keep_mine(ix, window, cx)
                         })),

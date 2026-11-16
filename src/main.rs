@@ -6,11 +6,14 @@ mod complete;
 mod file_tree;
 mod finder;
 mod format;
+mod generate;
 mod git;
 mod goindex;
 mod history;
 mod lang;
 mod lines;
+mod local_history;
+mod merge;
 mod problems;
 mod proc;
 mod recent;
@@ -23,10 +26,8 @@ mod workspace;
 
 use std::path::PathBuf;
 
-use gpui_kit::component::{ThemeMode, TitleBar};
-use gpui_kit::*;
+use gpui_kit::component::ThemeMode;
 
-use workspace::Workspace;
 
 fn main() {
     // `gust <folder> [file…]` opens that folder and those files, `gust <file>`
@@ -55,9 +56,13 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            theme::init(ThemeMode::Dark, cx);
+            let app = settings::load_app();
+            theme::set_font_size(app.font_size, cx);
+            theme::init(if app.dark { ThemeMode::Dark } else { ThemeMode::Light }, cx);
+            complete::set_hover_docs(app.hover_docs);
             workspace::init(cx);
             terminal::init(cx);
+            workspace::apply_keymap(&app.keymap, cx);
 
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
@@ -66,25 +71,7 @@ fn main() {
             })
             .detach();
 
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1280.), px(820.)),
-                    cx,
-                ))),
-                window_min_size: Some(size(px(640.), px(400.))),
-                ..TitleBar::window_options()
-            };
-            gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| {
-                    let mut workspace = Workspace::new(root, window, cx);
-                    for file in files {
-                        workspace.open(file, window, cx);
-                    }
-                    workspace
-                })
-            })
-            .expect("failed to open window");
+            workspace::open_window(root, files, cx);
             cx.activate(true);
         });
 }

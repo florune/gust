@@ -594,7 +594,7 @@ fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
 
     let sequence = match key {
         // Shift+Enter and Alt+Enter mean "newline without submitting" to
-        // programs that take multi-line input, such as Claude Code.
+        // programs that take multi-line input.
         "enter" if modifiers.shift || modifiers.alt => "\x1b\r".to_string(),
         "enter" => "\r".to_string(),
         "tab" if modifiers.shift => "\x1b[Z".to_string(),

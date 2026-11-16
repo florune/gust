@@ -52,6 +52,19 @@ pub struct Command {
 }
 
 impl Command {
+    /// The command as typed after a prompt that names its folder, relative
+    /// to `root`.
+    pub fn display_in(&self, root: &Path) -> String {
+        let folder = match self.dir.strip_prefix(root) {
+            Ok(rest) if rest.as_os_str().is_empty() => root
+                .file_name()
+                .map_or(".".to_string(), |name| name.to_string_lossy().into_owned()),
+            Ok(rest) => rest.to_string_lossy().replace('\\', "/"),
+            Err(_) => self.dir.to_string_lossy().into_owned(),
+        };
+        format!("{folder}> {}", self.display())
+    }
+
     /// The command as it would be typed, for showing what runs.
     pub fn display(&self) -> String {
         let mut line = quote(&self.program);
@@ -139,7 +152,96 @@ fn from_root(root: &Path, path: &str) -> PathBuf {
     }
 }
 
+/// Folders never searched for modules.
+const SKIPPED: &[&str] = &["node_modules", "vendor", "testdata", "target"];
+
+/// Whether `dir` holds a `package main` file.
+fn has_main(dir: &Path) -> bool {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        name.ends_with(".go")
+            && !name.ends_with("_test.go")
+            && std::fs::read_to_string(entry.path()).is_ok_and(|text| {
+                text.lines().any(|line| line.trim() == "package main")
+            })
+    })
+}
+
+/// Modules below `dir`, nearest first, a few levels deep.
+fn modules_below(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut level = vec![dir.to_path_buf()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for dir in level {
+            let mut children: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    !name.starts_with('.') && !SKIPPED.contains(&name.as_str())
+                })
+                .map(|entry| entry.path())
+                .collect();
+            children.sort();
+            for child in children {
+                if child.join("go.mod").is_file() {
+                    found.push(child);
+                } else {
+                    next.push(child);
+                }
+            }
+        }
+        level = next;
+    }
+    found
+}
+
+/// `path` from `base`, as `go` takes it: `.`, `./cmd/server`.
+fn relative_target(base: &Path, path: &Path) -> String {
+    match path.strip_prefix(base) {
+        Ok(rest) if rest.as_os_str().is_empty() => ".".to_string(),
+        Ok(rest) => format!("./{}", rest.to_string_lossy().replace('\\', "/")),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
+/// The Go module that `package` (from the project root) belongs to, and the
+/// package as named from inside it. The module is the nearest `go.mod` above
+/// the package; when there is none, as in a repository that keeps its Go
+/// code in a folder, the module below it with a `main` package, else the first.
+pub fn module_for(root: &Path, package: &str) -> Option<(PathBuf, String)> {
+    let package = package.trim();
+    let path = from_root(root, if package.is_empty() { "." } else { package });
+    let (dir, file) = if path.extension().is_some_and(|ext| ext == "go") {
+        (path.parent()?.to_path_buf(), Some(path.clone()))
+    } else {
+        (path.clone(), None)
+    };
+    if let Some(module) = dir.ancestors().find(|dir| dir.join("go.mod").is_file()) {
+        let target = relative_target(module, file.as_deref().unwrap_or(&dir));
+        return Some((module.to_path_buf(), target));
+    }
+    let modules = modules_below(&dir);
+    let module = modules
+        .iter()
+        .find(|module| has_main(module))
+        .or(modules.first())?
+        .clone();
+    Some((module, ".".to_string()))
+}
+
 impl RunConfig {
+    /// Where the program runs: the folder set, or else the root of its module.
+    pub fn work_dir(&self, root: &Path) -> PathBuf {
+        if !self.dir.trim().is_empty() {
+            return from_root(root, &self.dir);
+        }
+        module_for(root, &self.package).map_or(root.to_path_buf(), |(module, _)| module)
+    }
+
     /// The executable `go build` writes.
     pub fn executable(&self, root: &Path) -> PathBuf {
         if !self.output.trim().is_empty() {
@@ -156,18 +258,22 @@ impl RunConfig {
             .join(format!("{name}{suffix}"))
     }
 
-    /// `go build` for this configuration, run in the project root.
+    /// `go build` for this configuration, run in the package's module.
     pub fn build(&self, root: &Path) -> Command {
         let mut args = vec!["build".to_string()];
         args.extend(split_args(&self.build_flags));
         args.push("-o".to_string());
         args.push(self.executable(root).to_string_lossy().into_owned());
         let package = self.package.trim();
-        args.push(if package.is_empty() { "." } else { package }.to_string());
+        let (dir, target) = module_for(root, package).unwrap_or_else(|| {
+            let package = if package.is_empty() { "." } else { package };
+            (root.to_path_buf(), package.to_string())
+        });
+        args.push(target);
         Command {
             program: "go".to_string(),
             args,
-            dir: root.to_path_buf(),
+            dir,
             env: parse_env(&self.env),
         }
     }
@@ -177,7 +283,7 @@ impl RunConfig {
         Command {
             program: self.executable(root).to_string_lossy().into_owned(),
             args: split_args(&self.args),
-            dir: from_root(root, &self.dir),
+            dir: self.work_dir(root),
             env: parse_env(&self.env),
         }
     }
@@ -235,13 +341,69 @@ pub fn file_reference(line: &str) -> Option<(String, u32, u32)> {
 mod tests {
     use super::*;
 
+    /// A repository whose Go module is in a subfolder.
+    fn repository(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("gust-run-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, text) in [
+            ("README.md", "readme"),
+            ("ui/package.json", "{}"),
+            ("server/go.mod", "module server\n"),
+            ("server/main.go", "package main\n\nfunc main() {}\n"),
+            ("server/cmd/cli/main.go", "package main\n\nfunc main() {}\n"),
+            ("server/app/app.go", "package app\n"),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_module_in_a_folder_is_built_from_there() {
+        let root = repository("module");
+        let module = root.join("server");
+        // The project root has no go.mod: the module below it is found.
+        assert_eq!(module_for(&root, "."), Some((module.clone(), ".".to_string())));
+        assert_eq!(module_for(&root, ""), Some((module.clone(), ".".to_string())));
+        // Inside the module, the package is named from the module.
+        assert_eq!(
+            module_for(&root, "./server/cmd/cli"),
+            Some((module.clone(), "./cmd/cli".to_string()))
+        );
+        assert_eq!(
+            module_for(&root, "server/cmd/cli/main.go"),
+            Some((module.clone(), "./cmd/cli/main.go".to_string()))
+        );
+
+        let config = RunConfig {
+            package: ".".into(),
+            args: "server -c config/settings.yml".into(),
+            ..Default::default()
+        };
+        let build = config.build(&root);
+        assert_eq!(build.dir, module);
+        assert_eq!(build.args.last().map(String::as_str), Some("."));
+        assert_eq!(build.display_in(&root).split_once('>').unwrap().0, "server");
+        // Left empty, the program runs in its module, where its config files are.
+        assert_eq!(config.run(&root).dir, module);
+        let elsewhere = RunConfig {
+            dir: "ui".into(),
+            ..config
+        };
+        assert_eq!(elsewhere.run(&root).dir, root.join("ui"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
     #[test]
     fn arguments_are_split_like_a_shell_does() {
         assert_eq!(split_args(""), Vec::<String>::new());
         assert_eq!(split_args("-port 8080  -v"), ["-port", "8080", "-v"]);
         assert_eq!(
-            split_args(r#"-name "my game" -dir 'C:\some dir' -q "a \"b\"""#),
-            ["-name", "my game", "-dir", r"C:\some dir", "-q", r#"a "b""#]
+            split_args(r#"-name "my app" -dir 'C:\some dir' -q "a \"b\"""#),
+            ["-name", "my app", "-dir", r"C:\some dir", "-q", r#"a "b""#]
         );
         assert_eq!(split_args(r#"-empty "" x"#), ["-empty", "", "x"]);
     }
@@ -257,7 +419,7 @@ mod tests {
 
     #[test]
     fn a_config_builds_its_package_then_runs_the_executable_in_its_folder() {
-        let root = Path::new("/work/game");
+        let root = Path::new("/work/app");
         let config = RunConfig {
             name: "server".into(),
             package: "./cmd/server".into(),
@@ -297,8 +459,8 @@ mod tests {
     #[test]
     fn compiler_output_points_at_files() {
         assert_eq!(
-            file_reference("internal/game/room.go:359:12: undefined: addChip"),
-            Some(("internal/game/room.go".to_string(), 358, 11))
+            file_reference("internal/store/store.go:359:12: undefined: loadItem"),
+            Some(("internal/store/store.go".to_string(), 358, 11))
         );
         assert_eq!(
             file_reference("    D:/work/main_test.go:14 +0x1d"),

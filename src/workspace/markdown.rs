@@ -647,6 +647,7 @@ impl Workspace {
                 .min_h_0()
                 .child(editor(&doc.editor))
                 .children(self.render_blame_layer(ix, cx))
+                .children(self.render_test_markers(ix, cx))
                 .into_any_element();
         }
         let body = match doc.view {

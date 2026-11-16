@@ -112,8 +112,9 @@ fn line_and_column(word: &str) -> Option<(&str, u32, u32)> {
     (!rest.is_empty()).then(|| (rest, last.saturating_sub(1), 0))
 }
 
-/// A query as found in logs and stack traces, `kafka/consumer.go:159` or
-/// `/app/kafka/consumer.go:159 +0x1d`: the path, and the line to go to.
+/// A location as written in logs and stack traces, `path:line[:column]`,
+/// possibly with an absolute path and trailing text: the path, and the line
+/// and column to go to.
 pub fn split_location(query: &str) -> (String, Option<(u32, u32)>) {
     for word in query.split_whitespace() {
         // A drive letter alone is not a path with a line.
@@ -163,8 +164,8 @@ fn by_suffix<'a>(files: &'a [String], query: &str) -> Vec<&'a String> {
 
 /// The `limit` files that best answer `query`; with no query, the first files.
 ///
-/// A query with a line, such as `kafka/consumer.go:159`, finds the file by
-/// how its path ends and puts the line on each result.
+/// A query with a line finds files by how their paths end and puts the line
+/// on each result.
 pub fn find_files(files: &[String], query: &str, limit: usize) -> Vec<Hit> {
     let (query, location) = split_location(query);
     let query = query.trim_start_matches("./").to_string();
@@ -195,6 +196,52 @@ pub fn find_files(files: &[String], query: &str, limit: usize) -> Vec<Hit> {
         .collect();
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     ranked.into_iter().take(limit).map(|(_, path)| hit(path)).collect()
+}
+
+/// Where `query` occurs in `text`. Letter case is ignored unless the query
+/// has an uppercase letter, as in the text search; ignoring it covers ASCII.
+pub fn occurrences(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let exact = query.chars().any(char::is_uppercase) || !query.is_ascii();
+    if exact {
+        return text
+            .match_indices(query)
+            .map(|(ix, found)| ix..ix + found.len())
+            .collect();
+    }
+    let (bytes, wanted) = (text.as_bytes(), query.as_bytes());
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at + wanted.len() <= bytes.len() {
+        if bytes[at..at + wanted.len()].eq_ignore_ascii_case(wanted) {
+            found.push(at..at + wanted.len());
+            at += wanted.len();
+        } else {
+            at += 1;
+        }
+    }
+    found
+}
+
+/// `text` with every occurrence of `query` replaced, and how many there were.
+pub fn replace_all(text: &str, query: &str, replacement: &str) -> (String, usize) {
+    let found = occurrences(text, query);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for range in &found {
+        out.push_str(&text[at..range.start]);
+        out.push_str(replacement);
+        at = range.end;
+    }
+    out.push_str(&text[at..]);
+    (out, found.len())
+}
+
+/// Whether the project file at `path` is small text that can be searched.
+pub fn searchable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.len() <= MAX_SEARCHED_BYTES)
 }
 
 /// Lines containing `query` in the project's text files, up to `limit`.
@@ -265,11 +312,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replacing_follows_the_case_rule_of_the_search() {
+        assert_eq!(replace_all("Load load LOAD", "load", "fetch"), ("fetch fetch fetch".to_string(), 3));
+        assert_eq!(replace_all("Load load LOAD", "Load", "Fetch"), ("Fetch load LOAD".to_string(), 1));
+        assert_eq!(replace_all("aaa", "aa", "b"), ("ba".to_string(), 1));
+        assert_eq!(replace_all("中文 中文", "中文", "x"), ("x x".to_string(), 2));
+        assert_eq!(replace_all("text", "", "x"), ("text".to_string(), 0));
+    }
+
+
+    #[test]
     fn a_path_with_a_line_finds_the_file_by_its_ending() {
         let files: Vec<String> = [
-            "internal/kafka/consumer.go",
-            "internal/rabbit/consumer.go",
-            "cmd/kafka/main.go",
+            "internal/queue/worker.go",
+            "internal/cache/worker.go",
+            "cmd/queue/main.go",
         ]
         .map(String::from)
         .to_vec();
@@ -279,32 +336,32 @@ mod tests {
                 .map(|hit| (hit.path, hit.row, hit.col))
                 .collect()
         };
-        let kafka = ("internal/kafka/consumer.go".to_string(), 158, 0);
-        assert_eq!(found("kafka/consumer.go:159"), [kafka.clone()]);
+        let worker = ("internal/queue/worker.go".to_string(), 158, 0);
+        assert_eq!(found("queue/worker.go:159"), [worker.clone()]);
         // A server's own absolute path, as in a Go panic.
-        assert_eq!(found("\t/app/internal/kafka/consumer.go:159 +0x1d"), [kafka.clone()]);
+        assert_eq!(found("\t/app/internal/queue/worker.go:159 +0x1d"), [worker.clone()]);
         assert_eq!(
-            found(r"internal\kafka\consumer.go:159:7"),
-            [("internal/kafka/consumer.go".to_string(), 158, 6)]
+            found(r"internal\queue\worker.go:159:7"),
+            [("internal/queue/worker.go".to_string(), 158, 6)]
         );
         // Only the name: every file of that name.
-        assert_eq!(found("consumer.go:3").len(), 2);
+        assert_eq!(found("worker.go:3").len(), 2);
         // Without a line, the usual loose search.
-        assert_eq!(found("kafmain")[0].0, "cmd/kafka/main.go");
+        assert_eq!(found("quemain")[0].0, "cmd/queue/main.go");
     }
 
     #[test]
     fn locations_are_read_from_log_lines() {
         assert_eq!(
-            split_location("kafka/consumer.go:159"),
-            ("kafka/consumer.go".into(), Some((158, 0)))
+            split_location("queue/worker.go:159"),
+            ("queue/worker.go".into(), Some((158, 0)))
         );
         assert_eq!(split_location("at main.go:12:5,"), ("main.go".into(), Some((11, 4))));
         assert_eq!(
             split_location(r"C:\work\main.go:3"),
             ("C:/work/main.go".into(), Some((2, 0)))
         );
-        assert_eq!(split_location("consumer"), ("consumer".into(), None));
+        assert_eq!(split_location("worker"), ("worker".into(), None));
     }
 
 

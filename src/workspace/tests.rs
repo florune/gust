@@ -617,14 +617,14 @@ fn the_outline_lists_the_file_and_starts_at_the_caret(cx: &mut TestAppContext) {
             GO_MOD,
             (
                 "main.go",
-                "package main\n\ntype Room struct {\n\tChips int\n}\n\nfunc (r *Room) Add(n int) {\n\tr.Chips += n\n}\n\nfunc main() {\n}\n",
+                "package main\n\ntype Counter struct {\n\tValue int\n}\n\nfunc (c *Counter) Add(n int) {\n\tc.Value += n\n}\n\nfunc main() {\n}\n",
             ),
         ],
         "main.go",
     );
     fixture.set_cursor(7, 2, cx);
     let symbol = fixture.workspace.read_with(cx, |workspace, cx| workspace.current_symbol(cx));
-    assert_eq!(symbol.as_deref(), Some("Room.Add"));
+    assert_eq!(symbol.as_deref(), Some("Counter.Add"));
 
     fixture.press("ctrl-f12", cx);
     let (rows, selected) = fixture.workspace.read_with(cx, |workspace, _| {
@@ -636,9 +636,9 @@ fn the_outline_lists_the_file_and_starts_at_the_caret(cx: &mut TestAppContext) {
     assert_eq!(
         rows,
         [
-            ("Room".to_string(), "类型"),
-            ("    Chips".to_string(), "字段"),
-            ("Room.Add".to_string(), "方法"),
+            ("Counter".to_string(), "类型"),
+            ("    Value".to_string(), "字段"),
+            ("Counter.Add".to_string(), "方法"),
             ("main".to_string(), "函数"),
         ]
     );
@@ -1281,10 +1281,10 @@ fn an_interface_lists_its_implementations_first(cx: &mut TestAppContext) {
         "implementations",
         &[
             GO_MOD,
-            ("port.go", "package main\n\ntype Wallet interface {\n\tBalance() int\n}\n"),
+            ("port.go", "package main\n\ntype Store interface {\n\tLoad() int\n}\n"),
             (
                 "client.go",
-                "package main\n\ntype Client struct{}\n\nfunc (Client) Balance() int { return 0 }\n\nfunc use(w Wallet) {}\n",
+                "package main\n\ntype Client struct{}\n\nfunc (Client) Load() int { return 0 }\n\nfunc use(s Store) {}\n",
             ),
         ],
         "port.go",
@@ -1386,7 +1386,9 @@ fn building_writes_the_executable_and_says_so(cx: &mut TestAppContext) {
     assert_eq!(run_phase(&fixture, cx), super::run_panel::Phase::Built);
     assert!(fixture.root.join("bin/demo.exe").is_file());
     let text = console_text(&fixture, cx);
-    assert!(text.contains("$ go build -o"), "{text}");
+    // The prompt names the folder the build runs in.
+    let folder = fixture.root.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(text.contains(&format!("{folder}> go build -o")), "{text}");
     assert!(text.contains("编译成功"), "{text}");
 }
 
@@ -1432,7 +1434,7 @@ fn the_caret_line_says_who_changed_it_last(cx: &mut TestAppContext) {
     fixture.input("!", cx);
     cx.executor().advance_clock(std::time::Duration::from_millis(600));
     fixture.settle(cx);
-    assert_eq!(note(cx).as_deref(), Some("你 · 未提交的修改"));
+    assert_eq!(note(cx).as_deref(), Some("未提交的修改"));
     fixture.set_cursor(0, 0, cx);
     assert!(note(cx).unwrap().starts_with("Test, "));
 }
@@ -1668,8 +1670,8 @@ fn double_shift_opens_the_file_search_and_a_line_opens_at_it(cx: &mut TestAppCon
         cx,
         "double-shift",
         &[
-            ("internal/kafka/consumer.go", "package kafka\n\nfunc a() {}\n\nfunc b() {}\n"),
-            ("internal/rabbit/consumer.go", "package rabbit\n"),
+            ("internal/queue/worker.go", "package queue\n\nfunc a() {}\n\nfunc b() {}\n"),
+            ("internal/cache/worker.go", "package cache\n"),
             ("main.go", "package main\n"),
         ],
         "main.go",
@@ -1684,9 +1686,9 @@ fn double_shift_opens_the_file_search_and_a_line_opens_at_it(cx: &mut TestAppCon
     fixture.tap_shift(cx);
     assert!(fixture.workspace.read_with(cx, |workspace, _| workspace.palette.is_some()));
 
-    fixture.input("kafka/consumer.go:5", cx);
+    fixture.input("queue/worker.go:5", cx);
     fixture.press("enter", cx);
-    assert_eq!(fixture.active_file(cx), "internal/kafka/consumer.go");
+    assert_eq!(fixture.active_file(cx), "internal/queue/worker.go");
     assert_eq!(fixture.cursor(cx), (4, 0));
 }
 
@@ -1907,4 +1909,475 @@ fn a_project_reopens_with_its_tabs_and_carets(cx: &mut TestAppContext) {
     assert_eq!(fixture.active_file(cx), "a.md");
     assert_eq!(fixture.cursor(cx), (2, 3));
     let _ = std::fs::remove_dir_all(&other);
+}
+
+#[gpui_kit::test]
+fn another_project_opens_here_or_in_a_new_window(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "open-choice", &[("a.md", "a\n")], "a.md");
+    let other = std::env::temp_dir().join(format!("gust-ui-open-choice-other-{}", std::process::id()));
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("b.md"), "b\n").unwrap();
+
+    // A new window leaves this one as it was.
+    fixture.update(cx, |workspace, window, cx| workspace.choose_project(other.clone(), window, cx));
+    fixture.update(cx, |workspace, window, cx| {
+        workspace.on_open_in_new_window(&super::windows::OpenInNewWindow, window, cx)
+    });
+    assert_eq!(cx.windows().len(), 2);
+    assert_eq!(fixture.tabs(cx), ["a.md"]);
+
+    // Enter opens it here.
+    fixture.update(cx, |workspace, window, cx| workspace.choose_project(other.clone(), window, cx));
+    fixture.press("enter", cx);
+    let root = fixture.workspace.read_with(cx, |workspace, _| workspace.root.clone());
+    assert_eq!(root, other);
+    let _ = std::fs::remove_dir_all(&other);
+}
+
+/// The rows of the open palette, in whatever mode it is.
+fn rows(fixture: &Fixture, cx: &mut TestAppContext) -> Vec<String> {
+    fixture.workspace.read_with(cx, |workspace, _| {
+        let palette = workspace.palette.as_ref().expect("the palette is open");
+        palette.hits.iter().map(|hit| hit.preview.clone()).collect()
+    })
+}
+
+const STORE: &str = "package store\n\n// Store keeps items.\ntype Store struct{}\n\n// Load returns an item.\nfunc (s *Store) Load(id string) int {\n\treturn 0\n}\n";
+
+#[gpui_kit::test]
+fn ctrl_n_finds_a_declaration_anywhere_in_the_project(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "find-symbol",
+        &[GO_MOD, ("store/store.go", STORE), ("main.go", "package main\n\nfunc main() {}\n")],
+        "main.go",
+    );
+    fixture.press("ctrl-n", cx);
+    fixture.input("store.lo", cx);
+    assert_eq!(rows(&fixture, cx), ["Store.Load"]);
+    fixture.press("enter", cx);
+    assert_eq!(fixture.active_file(cx), "store/store.go");
+    assert_eq!(fixture.cursor(cx), (6, 16));
+}
+
+#[gpui_kit::test]
+fn ctrl_q_shows_the_declaration_and_its_comment(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "quick-doc",
+        &[
+            GO_MOD,
+            ("store/store.go", STORE),
+            (
+                "main.go",
+                "package main\n\nimport \"example.com/demo/store\"\n\nfunc main() {\n\tvar s store.Store\n\ts.Load(\"a\")\n}\n",
+            ),
+        ],
+        "main.go",
+    );
+    fixture.set_cursor(6, 4, cx);
+    fixture.press("ctrl-q", cx);
+    let shown = fixture.workspace.read_with(cx, |workspace, _| {
+        workspace
+            .quick_doc
+            .as_ref()
+            .map(|quick| (quick.doc.header.clone(), quick.doc.comment.clone()))
+    });
+    assert_eq!(
+        shown,
+        Some(("func (s *Store) Load(id string) int".to_string(), "Load returns an item.".to_string()))
+    );
+    // Any key closes it.
+    fixture.press("escape", cx);
+    assert!(fixture.workspace.read_with(cx, |workspace, _| workspace.quick_doc.is_none()));
+}
+
+#[gpui_kit::test]
+fn a_test_function_runs_from_the_caret_or_its_marker(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "run-test",
+        &[
+            GO_MOD,
+            ("store/store.go", STORE),
+            (
+                "store/store_test.go",
+                "package store\n\nimport \"testing\"\n\nfunc TestLoad(t *testing.T) {\n\t_ = (&Store{}).Load(\"a\")\n}\n",
+            ),
+        ],
+        "store/store_test.go",
+    );
+    // A run marker sits beside the test function.
+    let markers = fixture.workspace.update(cx, |workspace, cx| {
+        let ix = workspace.active.unwrap();
+        workspace.render_test_markers(ix, cx).is_some()
+    });
+    assert!(markers);
+
+    fixture.set_cursor(5, 2, cx);
+    fixture.press("ctrl-shift-f10", cx);
+    assert_eq!(run_phase(&fixture, cx), super::run_panel::Phase::Running);
+    assert!(console_text(&fixture, cx).contains("go test -v -count=1 -run ^TestLoad$ ./store"));
+
+    // Outside a test function: the package's tests.
+    fixture.set_cursor(0, 0, cx);
+    fixture.press("ctrl-shift-f10", cx);
+    let text = console_text(&fixture, cx);
+    assert!(text.contains("go test -v -count=1 ./store") && !text.contains("-run ^"), "{text}");
+}
+
+#[gpui_kit::test]
+fn shift_f6_renames_a_symbol_in_open_and_closed_files(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "rename-symbol",
+        &[
+            GO_MOD,
+            ("store/store.go", STORE),
+            (
+                "main.go",
+                "package main\n\nimport \"example.com/demo/store\"\n\nfunc main() {\n\tvar s store.Store\n\ts.Load(\"a\")\n\ts.Load(\"b\")\n}\n",
+            ),
+        ],
+        "main.go",
+    );
+    fixture.set_cursor(6, 4, cx);
+    fixture.press("shift-f6", cx);
+    let detail = fixture.workspace.read_with(cx, |workspace, _| {
+        workspace.file_prompt.as_ref().map(|prompt| match &prompt.action {
+            super::file_ops::FileAction::RenameSymbol(plan) => (plan.count(), plan.places.len()),
+            _ => (0, 0),
+        })
+    });
+    assert_eq!(detail, Some((3, 2)));
+
+    // The name is selected: typing replaces it.
+    fixture.input("Fetch", cx);
+    fixture.press("enter", cx);
+    assert_eq!(
+        fixture.text(cx),
+        "package main\n\nimport \"example.com/demo/store\"\n\nfunc main() {\n\tvar s store.Store\n\ts.Fetch(\"a\")\n\ts.Fetch(\"b\")\n}\n"
+    );
+    let store = std::fs::read_to_string(fixture.root.join("store/store.go")).unwrap();
+    assert!(store.contains("func (s *Store) Fetch(id string) int"), "{store}");
+}
+
+#[gpui_kit::test]
+fn ctrl_shift_r_replaces_text_in_every_file(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "replace",
+        &[("a.md", "old one\n"), ("docs/b.md", "Old two old\n"), ("c.md", "nothing\n")],
+        "a.md",
+    );
+    fixture.press("ctrl-shift-r", cx);
+    fixture.input("old", cx);
+    fixture.update(cx, |workspace, window, cx| {
+        let replacement = workspace.palette.as_ref().unwrap().replacement.clone().unwrap();
+        replacement.update(cx, |input, cx| input.set_value("new", window, cx));
+        workspace.replace_in_files(window, cx);
+    });
+    assert_eq!(fixture.text(cx), "new one\n");
+    assert_eq!(std::fs::read_to_string(fixture.root.join("docs/b.md")).unwrap(), "new two new\n");
+    assert_eq!(std::fs::read_to_string(fixture.root.join("c.md")).unwrap(), "nothing\n");
+    let notice = fixture.workspace.read_with(cx, |workspace, _| workspace.notice.clone());
+    assert_eq!(notice.as_deref(), Some("已替换 3 处，2 个文件"));
+}
+
+#[gpui_kit::test]
+fn local_history_keeps_saved_versions_to_compare_and_restore(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "local-history", &[("a.md", "one\n")], "a.md");
+    fixture.set_cursor(0, 3, cx);
+    fixture.input("!", cx);
+    fixture.press("ctrl-s", cx);
+    fixture.input("?", cx);
+    fixture.press("ctrl-s", cx);
+    assert_eq!(fixture.text(cx), "one!?\n");
+
+    let path = fixture.root.join("a.md");
+    fixture.update(cx, |workspace, window, cx| workspace.show_local_history(path.clone(), window, cx));
+    assert_eq!(rows(&fixture, cx).len(), 2);
+
+    // The oldest version: what the file was before the first save.
+    fixture.press("down", cx);
+    fixture.press("enter", cx);
+    let sides = fixture.workspace.read_with(cx, |workspace, cx| {
+        let (left, right) = workspace.diff.as_ref().unwrap().sides().expect("both sides read");
+        (left.read(cx).text().to_string(), right.read(cx).text().to_string())
+    });
+    assert_eq!(sides, ("one\n".to_string(), "one!?\n".to_string()));
+
+    fixture.update(cx, |workspace, window, cx| {
+        let version = match &workspace.diff.as_ref().unwrap().source {
+            super::compare_view::Source::Version { version, .. } => version.clone(),
+            _ => unreachable!(),
+        };
+        workspace.restore_version(&path, &version, window, cx);
+    });
+    assert_eq!(fixture.text(cx), "one\n");
+}
+
+fn palette_mode(fixture: &Fixture, cx: &mut TestAppContext) -> Option<super::palette::Mode> {
+    fixture
+        .workspace
+        .read_with(cx, |workspace, _| workspace.palette.as_ref().map(|palette| palette.mode))
+}
+
+#[gpui_kit::test]
+fn settings_change_the_font_size_and_what_saving_does(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "settings", &[GO_MOD, ("main.go", "package main\n")], "main.go");
+    let size = |cx: &mut TestAppContext| {
+        cx.update(|cx| f32::from(gpui_kit::component::ActiveTheme::theme(cx).mono_font_size))
+    };
+    fixture.update(cx, |workspace, _, cx| {
+        workspace.change_app_settings(cx, |app| {
+            app.font_size = 16.;
+            app.format_on_save = false;
+        })
+    });
+    assert_eq!(size(cx), 16.);
+
+    // Ctrl+wheel over the editor makes the code larger.
+    let over = fixture.point_of(0..1, cx);
+    fixture.mouse(
+        gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
+            position: over,
+            delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., 3.)),
+            modifiers: gpui_kit::Modifiers::control(),
+            ..Default::default()
+        }),
+        cx,
+    );
+    assert_eq!(size(cx), 17.);
+
+    // Saving writes the text as it is.
+    fixture.set_cursor(0, 12, cx);
+    fixture.input("\nfunc  main( ) {}", cx);
+    fixture.press("ctrl-s", cx);
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("main.go")).unwrap(),
+        "package main\nfunc  main( ) {}\n"
+    );
+}
+
+#[gpui_kit::test]
+fn amend_stash_and_a_new_branch_from_the_commit_panel(cx: &mut TestAppContext) {
+    let fixture = Fixture::in_repository(cx, "git-more", &[("notes.md", "one\n")], "notes.md");
+    fixture.settle(cx);
+    let message = |cx: &mut TestAppContext| {
+        fixture.workspace.read_with(cx, |workspace, cx| workspace.commit_message.read(cx).value().to_string())
+    };
+    fixture.update(cx, |workspace, window, cx| workspace.set_amend_for_test(true, window, cx));
+    assert_eq!(message(cx), "first");
+
+    // Stash takes the edit away; bringing it back restores it.
+    std::fs::write(fixture.root.join("notes.md"), "changed\n").unwrap();
+    fixture.files_changed(cx);
+    fixture.update(cx, |workspace, window, cx| {
+        workspace.open_file_prompt(super::file_ops::FileAction::Stash, window, cx)
+    });
+    fixture.press("enter", cx);
+    fixture.files_changed(cx);
+    assert_eq!(std::fs::read_to_string(fixture.root.join("notes.md")).unwrap(), "one\n");
+    fixture.update(cx, |workspace, window, cx| workspace.show_stashes(window, cx));
+    assert_eq!(palette_mode(&fixture, cx), Some(super::palette::Mode::Stashes));
+    fixture.press("enter", cx);
+    assert_eq!(std::fs::read_to_string(fixture.root.join("notes.md")).unwrap(), "changed\n");
+
+    fixture.update(cx, |workspace, window, cx| {
+        workspace.open_file_prompt(super::file_ops::FileAction::NewBranch, window, cx)
+    });
+    fixture.input("feature/x", cx);
+    fixture.press("enter", cx);
+    fixture.update(cx, |workspace, _, cx| workspace.refresh_git(cx));
+    let branch = fixture
+        .workspace
+        .read_with(cx, |workspace, _| workspace.git.as_ref().map(|status| status.branch.clone()));
+    assert_eq!(branch.as_deref(), Some("feature/x"));
+}
+
+#[gpui_kit::test]
+fn alt_enter_adds_json_tags_and_implements_an_interface(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "intentions",
+        &[
+            GO_MOD,
+            ("port/port.go", "package port\n\ntype Namer interface {\n\tName() string\n}\n"),
+            ("main.go", "package main\n\ntype Config struct {\n\tKey string\n}\n"),
+        ],
+        "main.go",
+    );
+    fixture.set_cursor(3, 2, cx);
+    fixture.press("alt-enter", cx);
+    assert_eq!(rows(&fixture, cx), ["添加 json 标签", "为 Config 实现接口…", "运行 go mod tidy"]);
+    fixture.press("enter", cx);
+    assert!(fixture.text(cx).contains("Key string `json:\"key\"`"), "{}", fixture.text(cx));
+
+    fixture.set_cursor(2, 6, cx);
+    fixture.press("alt-enter", cx);
+    fixture.input("实现", cx);
+    fixture.press("enter", cx);
+    assert_eq!(palette_mode(&fixture, cx), Some(super::palette::Mode::Interfaces));
+    fixture.press("enter", cx);
+    assert!(
+        fixture.text(cx).contains("func (c *Config) Name() string {\n\tpanic(\"not implemented\")\n}"),
+        "{}",
+        fixture.text(cx)
+    );
+}
+
+#[gpui_kit::test]
+fn tab_after_iferr_expands_the_template(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "templates",
+        &[GO_MOD, ("main.go", "package main\n\nfunc load() (int, error) {\n\t\n}\n")],
+        "main.go",
+    );
+    fixture.set_cursor(3, 1, cx);
+    fixture.input("iferr", cx);
+    fixture.press("escape", cx);
+    fixture.press("tab", cx);
+    assert_eq!(
+        fixture.text(cx),
+        "package main\n\nfunc load() (int, error) {\n\tif err != nil {\n\t\treturn 0, err\n\t}\n}\n"
+    );
+    assert_eq!(fixture.cursor(cx), (4, 15));
+}
+
+#[gpui_kit::test]
+fn ctrl_shift_a_runs_a_command_by_name(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "find-action",
+        &[GO_MOD, ("main.go", "package main\n\nfunc main() {}\n")],
+        "main.go",
+    );
+    fixture.press("ctrl-shift-a", cx);
+    fixture.input("文件结构", cx);
+    assert_eq!(rows(&fixture, cx), ["文件结构"]);
+    fixture.press("enter", cx);
+    assert_eq!(palette_mode(&fixture, cx), Some(super::palette::Mode::Outline));
+}
+
+#[gpui_kit::test]
+fn tab_still_indents_where_no_template_applies(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(
+        cx,
+        "plain-tab",
+        &[GO_MOD, ("main.go", "package main\n\nfunc main() {\nx\n}\n")],
+        "main.go",
+    );
+    fixture.set_cursor(3, 0, cx);
+    fixture.press("tab", cx);
+    assert_eq!(fixture.text(cx), "package main\n\nfunc main() {\n\tx\n}\n");
+}
+
+#[gpui_kit::test]
+fn conflicts_are_resolved_from_the_commit_panel_one_file_at_a_time(cx: &mut TestAppContext) {
+    let fixture = Fixture::in_repository(
+        cx,
+        "merge-dialog",
+        &[("a.txt", "top\none\nm1\nm2\nm3\nm4\ntwo\nend\n"), ("b.txt", "b\n"), ("other.md", "x\n")],
+        "other.md",
+    );
+    let root = fixture.root.clone();
+    git(&root, &["switch", "--quiet", "-c", "feature"]);
+    std::fs::write(root.join("a.txt"), "top\nONE-feature\nm1\nm2\nm3\nm4\ntwo-feature\nend\n").unwrap();
+    std::fs::write(root.join("b.txt"), "b-feature\n").unwrap();
+    git(&root, &["commit", "--quiet", "-am", "feature"]);
+    git(&root, &["switch", "--quiet", "main"]);
+    std::fs::write(root.join("a.txt"), "top\nONE-main\nm1\nm2\nm3\nm4\ntwo-main\nend\n").unwrap();
+    std::fs::write(root.join("b.txt"), "b-main\n").unwrap();
+    git(&root, &["commit", "--quiet", "-am", "main"]);
+    let merged = crate::proc::command("git").args(["merge", "feature"]).current_dir(&root).output().unwrap();
+    assert!(!merged.status.success());
+    fixture.files_changed(cx);
+    fixture.settle(cx);
+    let conflicted = |cx: &mut TestAppContext| {
+        fixture.workspace.read_with(cx, |workspace, _| workspace.conflicted_paths())
+    };
+    assert_eq!(conflicted(cx), ["a.txt", "b.txt"]);
+
+    // The commit panel opens the list; a.txt opens in the merge window.
+    fixture.update(cx, |workspace, window, cx| {
+        workspace.open_merge_dialog(window, cx);
+        workspace.open_merge("a.txt".into(), cx);
+    });
+    let (rows, conflicts) = fixture.workspace.read_with(cx, |workspace, _| {
+        let merge = workspace.merge_dialog.as_ref().unwrap().merge.as_ref().unwrap();
+        (merge.rows.len(), merge.decisions.len())
+    });
+    assert_eq!((rows, conflicts), (8, 2));
+
+    // First conflict: keep the left (incoming), drop the right; second: keep both.
+    use super::merge_view::Decision::{Drop, Keep};
+    fixture.update(cx, |workspace, window, cx| {
+        workspace.decide(0, true, Keep, cx);
+        workspace.decide(0, false, Drop, cx);
+        workspace.decide(1, true, Keep, cx);
+        workspace.decide(1, false, Keep, cx);
+        workspace.apply_merge(window, cx);
+    });
+    fixture.settle(cx);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "top\nONE-feature\nm1\nm2\nm3\nm4\ntwo-main\ntwo-feature\nend\n"
+    );
+
+    // b.txt takes the incoming side whole.
+    fixture.update(cx, |workspace, window, cx| workspace.take_side("b.txt".into(), false, window, cx));
+    fixture.settle(cx);
+    fixture.update(cx, |workspace, _, cx| workspace.refresh_git(cx));
+    assert!(conflicted(cx).is_empty());
+    assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "b-feature\n");
+}
+
+#[gpui_kit::test]
+fn the_keymap_page_rebinds_a_command(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "keymap", &[GO_MOD, ("main.go", "package main\n")], "main.go");
+
+    // The defaults the page lists are the keys actually bound.
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        for command in super::commands::all() {
+            let action = (command.action)();
+            let bound: Vec<String> = keymap
+                .bindings_for_action(action.as_ref())
+                .filter_map(|binding| super::commands::binding_of(binding.keystrokes()[0].inner()))
+                .collect();
+            for (key, _) in command.defaults {
+                let key = super::commands::normalized(key);
+                assert!(bound.contains(&key), "{} is not bound to {key}", command.id);
+            }
+        }
+    });
+
+    // Recording takes the key without running what it was bound to.
+    fixture.update(cx, |workspace, window, cx| {
+        workspace.on_open_keymap(&super::keymap_view::OpenKeymap, window, cx);
+        workspace.start_recording("save", window, cx);
+    });
+    fixture.press("ctrl-k", cx);
+    fixture.update(cx, |workspace, _, cx| workspace.remove_key("save", "ctrl-s".to_string(), cx));
+    let keys = fixture.workspace.read_with(cx, |workspace, _| workspace.app.keymap.get("save").cloned());
+    assert_eq!(keys, Some(vec!["ctrl-k".to_string()]));
+
+    fixture.press("escape", cx);
+    fixture.set_cursor(0, 12, cx);
+    fixture.input("\n", cx);
+    fixture.press("ctrl-s", cx);
+    assert!(fixture.dirty(cx));
+    fixture.press("ctrl-k", cx);
+    assert!(!fixture.dirty(cx));
+
+    // Back to the defaults.
+    fixture.update(cx, |workspace, _, cx| workspace.reset_keymap(cx));
+    fixture.input("\n", cx);
+    fixture.press("ctrl-k", cx);
+    assert!(fixture.dirty(cx));
+    fixture.press("ctrl-s", cx);
+    assert!(!fixture.dirty(cx));
 }

@@ -331,16 +331,30 @@ pub fn init(mode: ThemeMode, cx: &mut App) {
 /// Switch between the dark and the light theme.
 pub fn change(mode: ThemeMode, cx: &mut App) {
     Theme::change(mode, None, cx);
+    let size = f32::from_bits(FONT_SIZE.load(std::sync::atomic::Ordering::Relaxed));
     // Loading a theme caps the selection at 30% opacity, which leaves it
     // faint next to GoLand's; selections are drawn under the text, so a
     // stronger one hides nothing.
     Theme::update(cx, |theme| {
+        if size > 0. {
+            theme.mono_font_size = gpui_kit::px(size);
+        }
         theme.selection = if theme.is_dark() {
             Hsla::from(rgb(0x2d5fbf)).opacity(0.5)
         } else {
             Hsla::from(rgb(0x3d8ef0)).opacity(0.4)
         };
     });
+    cx.refresh_windows();
+}
+
+/// The code font size chosen, kept across theme changes; 0 is the theme's own.
+static FONT_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Set the size of the code font, in editors and terminals.
+pub fn set_font_size(size: f32, cx: &mut App) {
+    FONT_SIZE.store(size.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    Theme::update(cx, |theme| theme.mono_font_size = gpui_kit::px(size));
     cx.refresh_windows();
 }
 

@@ -207,6 +207,9 @@ impl Workspace {
         .item(act("向右拆分", true, |this, path, window, cx| {
             this.split_right(path, window, cx)
         }))
+        .item(act("本地历史…", true, |this, path, window, cx| {
+            this.show_local_history(path.to_path_buf(), window, cx)
+        }))
     }
 
     pub(super) fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

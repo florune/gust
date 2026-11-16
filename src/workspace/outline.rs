@@ -21,7 +21,7 @@ pub(super) fn init(cx: &mut App) {
     ]);
 }
 
-fn kind_label(kind: Kind) -> &'static str {
+pub(super) fn kind_label(kind: Kind) -> &'static str {
     match kind {
         Kind::Func => "函数",
         Kind::Method => "方法",

@@ -32,6 +32,8 @@ pub enum FileTreeEvent {
     New { dir: PathBuf, folder: bool },
     Rename(PathBuf),
     Delete(PathBuf),
+    /// Show the versions of a file kept in local history.
+    History(PathBuf),
 }
 
 /// The project's files as a flat list of the rows currently visible.
@@ -318,6 +320,9 @@ impl FileTree {
                     .separator()
                     .item(emit("重命名…", FileTreeEvent::Rename, menu_path.clone()))
                     .item(emit("删除…", FileTreeEvent::Delete, menu_path.clone()))
+                    .when(!is_dir, |menu| {
+                        menu.item(emit("本地历史…", FileTreeEvent::History, menu_path.clone()))
+                    })
                     .separator();
                 let absolute = menu_path.to_string_lossy().into_owned();
                 let relative = relative.clone();

@@ -210,7 +210,7 @@ impl Workspace {
     }
 
     /// Run a git command off the main thread, then show its outcome and refresh.
-    fn run_git(
+    pub(super) fn run_git(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -258,16 +258,93 @@ impl Workspace {
             .filter(|change| !self.excluded.contains(&change.path))
             .map(|change| change.path.clone())
             .collect();
+        let root = status.root.clone();
+        let unresolved: Vec<&String> = paths
+            .iter()
+            .filter(|path| {
+                std::fs::read_to_string(root.join(path))
+                    .is_ok_and(|text| !crate::merge::conflicts(&text).is_empty())
+            })
+            .collect();
+        if let Some(first) = unresolved.first() {
+            self.notice = Some(format!("{first} 等 {} 个文件仍有未解决的合并冲突", unresolved.len()).into());
+            cx.notify();
+            return;
+        }
         let message = self.commit_message.read(cx).value().to_string();
+        let amend = self.amend;
         self.run_git(
             window,
             cx,
-            move |root| git::commit(&root, &message, &paths),
+            move |root| git::commit(&root, &message, &paths, amend),
             |this, window, cx| {
+                this.amend = false;
                 this.commit_message
                     .update(cx, |input, cx| input.set_value("", window, cx));
             },
         );
+    }
+
+    /// Amend the last commit, or not; amending starts from its message.
+    fn set_amend(&mut self, amend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.amend = amend;
+        if amend
+            && self.commit_message.read(cx).value().trim().is_empty()
+            && let Some(root) = self.git.as_ref().map(|status| status.root.clone())
+            && let Some(message) = git::last_message(&root)
+        {
+            self.commit_message
+                .update(cx, |input, cx| input.set_value(message, window, cx));
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_amend_for_test(&mut self, amend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_amend(amend, window, cx);
+    }
+
+    pub(super) fn create_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_git(window, cx, move |root| git::create_branch(&root, &name), |_, _, _| {});
+    }
+
+    pub(super) fn stash_changes(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_all(cx);
+        self.run_git(window, cx, move |root| git::stash(&root, &message), |_, _, _| {});
+    }
+
+    pub(super) fn unstash(&mut self, reference: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_git(window, cx, move |root| git::unstash(&root, &reference), |_, _, _| {});
+    }
+
+    /// The stashes, newest first, to pick one to bring back.
+    pub(super) fn show_stashes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.git.as_ref().map(|status| status.root.clone()) else {
+            return;
+        };
+        let hits: Vec<crate::finder::Hit> = git::stashes(&root)
+            .into_iter()
+            .map(|stash| crate::finder::Hit {
+                path: stash.reference.clone(),
+                row: 0,
+                col: 0,
+                preview: stash.message,
+                tag: "",
+                detail: stash.reference,
+            })
+            .collect();
+        if hits.is_empty() {
+            self.notice = Some("没有暂存的改动".into());
+            cx.notify();
+            return;
+        }
+        self.open_palette(super::palette::Mode::Stashes, window, cx);
+        if let Some(palette) = &mut self.palette {
+            palette.title = Some(format!("{} 个暂存", hits.len()).into());
+            palette.found = hits.clone();
+            palette.hits = hits;
+        }
+        cx.notify();
     }
 
     fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -314,6 +391,21 @@ impl Workspace {
                 .icon(icon("git-branch"))
                 .label(label)
                 .dropdown_menu(move |mut menu, _, _| {
+                    let act = |label: &'static str, run: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+                        let workspace = workspace.clone();
+                        PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            workspace.update(cx, |this, cx| run(this, window, cx)).ok();
+                        })
+                    };
+                    menu = menu
+                        .item(act("新建分支…", |this, window, cx| {
+                            this.open_file_prompt(super::file_ops::FileAction::NewBranch, window, cx)
+                        }))
+                        .item(act("暂存改动 (stash)…", |this, window, cx| {
+                            this.open_file_prompt(super::file_ops::FileAction::Stash, window, cx)
+                        }))
+                        .item(act("恢复暂存…", |this, window, cx| this.show_stashes(window, cx)))
+                        .separator();
                     for branch in &branches {
                         let workspace = workspace.clone();
                         let name = branch.clone();
@@ -343,7 +435,7 @@ impl Workspace {
                 .justify_center()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child("这个文件夹不是 Git 仓库")
+                .child("当前文件夹不是 Git 仓库")
                 .into_any_element();
         };
         let selected = status
@@ -358,6 +450,11 @@ impl Workspace {
             .and_then(|tab| tab.working_path());
 
         let workspace = cx.entity().downgrade();
+        let conflicts = status
+            .changes
+            .iter()
+            .filter(|change| change.kind == ChangeKind::Conflict)
+            .count();
         let rows = status
             .changes
             .iter()
@@ -433,14 +530,34 @@ impl Workspace {
                             .child(change.kind.letter()),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_diff(Some(path.clone()), window, cx)
+                        if this.conflicted_paths().contains(&path) {
+                            this.open_merge_dialog(window, cx);
+                            this.open_merge(path.clone(), cx);
+                        } else {
+                            this.open_diff(Some(path.clone()), window, cx)
+                        }
                     }))
                     .context_menu({
                         let workspace = workspace.clone();
                         let path = change.path.clone();
+                        let conflicted = change.kind == ChangeKind::Conflict;
                         move |menu, _, _| {
+                            let resolve = (workspace.clone(), path.clone());
                             let workspace = workspace.clone();
                             let path = path.clone();
+                            let menu = if conflicted {
+                                menu.item(PopupMenuItem::new("解决冲突…").on_click(move |_, window, cx| {
+                                    let (workspace, path) = resolve.clone();
+                                    workspace
+                                        .update(cx, |this, cx| {
+                                            this.open_merge_dialog(window, cx);
+                                            this.open_merge(path, cx);
+                                        })
+                                        .ok();
+                                }))
+                            } else {
+                                menu
+                            };
                             menu.item(PopupMenuItem::new("回滚…").on_click(move |_, window, cx| {
                                 let path = path.clone();
                                 workspace
@@ -460,6 +577,16 @@ impl Workspace {
                     .child(Textarea::new(&self.commit_message).small()),
             )
             .child(
+                h_flex().px_2().pb_2().child(
+                    Checkbox::new("amend")
+                        .checked(self.amend)
+                        .label("修改上次提交")
+                        .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                            this.set_amend(*checked, window, cx)
+                        })),
+                ),
+            )
+            .child(
                 h_flex()
                     .px_2()
                     .gap_1()
@@ -467,9 +594,13 @@ impl Workspace {
                         Button::new("commit")
                             .primary()
                             .small()
-                            .label(format!("提交 {selected} 个文件"))
+                            .label(if self.amend {
+                                "修改上次提交".to_string()
+                            } else {
+                                format!("提交 {selected} 个文件")
+                            })
                             .loading(self.git_busy)
-                            .disabled(selected == 0 || self.git_busy)
+                            .disabled((selected == 0 && !self.amend) || self.git_busy || conflicts > 0)
                             .on_click(cx.listener(|this, _, window, cx| this.commit(window, cx))),
                     )
                     .child(div().flex_1())
@@ -492,6 +623,29 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, window, cx| this.push(window, cx))),
                     ),
             )
+            .when(conflicts > 0, |panel| {
+                panel.child(
+                    h_flex()
+                        .mx_2()
+                        .mt_2()
+                        .px_2()
+                        .py_1p5()
+                        .gap_1p5()
+                        .rounded(px(5.))
+                        .text_xs()
+                        .text_color(crate::theme::palette(cx).red)
+                        .bg(crate::theme::palette(cx).red.opacity(0.1))
+                        .child(icon("git-merge").xsmall())
+                        .child(div().flex_1().child(format!("{conflicts} 个文件有合并冲突")))
+                        .child(
+                            Button::new("resolve-conflicts")
+                                .xsmall()
+                                .primary()
+                                .label("解决冲突")
+                                .on_click(cx.listener(|this, _, window, cx| this.open_merge_dialog(window, cx))),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .px_3()

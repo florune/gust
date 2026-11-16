@@ -560,7 +560,7 @@ impl Index {
     }
 
     /// The symbols declared in the `_test.go` files of `dir`.
-    fn test_package(&self, dir: &Path) -> Arc<Package> {
+    pub fn test_package(&self, dir: &Path) -> Arc<Package> {
         self.load(dir, true)
     }
 
@@ -1652,6 +1652,8 @@ pub struct Usages {
     /// For an interface or one of its methods: the types or methods that implement it.
     pub implementations: Vec<Hit>,
     pub usages: Vec<Hit>,
+    /// Where the name is declared.
+    pub declaration: Option<Location>,
 }
 
 /// Node kinds a name can be written as.
@@ -1809,6 +1811,7 @@ pub fn usages(
 
     let mut out = Usages {
         name: name.clone(),
+        declaration: Some(target.clone()),
         ..Default::default()
     };
     for path in &candidates {
@@ -2075,6 +2078,384 @@ pub fn enclosing(items: &[OutlineItem], row: u32) -> Option<&OutlineItem> {
         .iter()
         .filter(|item| item.row <= row && row <= item.end_row)
         .max_by_key(|item| (item.row, item.col))
+}
+
+// ---------------------------------------------------------------- symbols
+
+/// A declaration found by name across the project.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SymbolHit {
+    pub name: String,
+    pub owner: Option<String>,
+    pub kind: Kind,
+    pub detail: String,
+    pub file: PathBuf,
+    pub row: u32,
+    pub col: u32,
+}
+
+/// Declarations in the packages of `dirs` whose names answer `query`, best
+/// first. Types come before functions, functions before the rest.
+pub fn find_symbols(index: &Index, dirs: &[PathBuf], query: &str, limit: usize) -> Vec<SymbolHit> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    // `Type.method` narrows to members of matching types.
+    let (owner_query, name_query) = match query.rsplit_once('.') {
+        Some((owner, name)) => (Some(owner), name),
+        None => (None, query),
+    };
+    let order = |kind: Kind| match kind {
+        Kind::Type => 0,
+        Kind::Func | Kind::Method => 1,
+        _ => 2,
+    };
+    let mut found: Vec<(u8, u8, SymbolHit)> = Vec::new();
+    for dir in dirs {
+        let packages = [index.package(dir), index.test_package(dir)];
+        for symbol in packages.iter().flat_map(|package| package.symbols.iter()) {
+            if symbol.embedded {
+                continue;
+            }
+            let Some(score) = (if name_query.is_empty() {
+                Some(0)
+            } else {
+                rank(&symbol.name, name_query)
+            }) else {
+                continue;
+            };
+            if let Some(owner_query) = owner_query {
+                let Some(owner) = &symbol.owner else {
+                    continue;
+                };
+                if rank(owner, owner_query).is_none() {
+                    continue;
+                }
+            }
+            found.push((
+                score,
+                order(symbol.kind),
+                SymbolHit {
+                    name: symbol.name.clone(),
+                    owner: symbol.owner.clone(),
+                    kind: symbol.kind,
+                    detail: symbol.detail.clone(),
+                    file: symbol.file.to_path_buf(),
+                    row: symbol.row,
+                    col: symbol.col,
+                },
+            ));
+        }
+    }
+    found.sort_by(|a, b| {
+        (a.0, a.1, a.2.name.len(), &a.2.name, &a.2.file)
+            .cmp(&(b.0, b.1, b.2.name.len(), &b.2.name, &b.2.file))
+    });
+    found.dedup_by(|a, b| a.2.file == b.2.file && a.2.row == b.2.row && a.2.col == b.2.col);
+    found.into_iter().take(limit).map(|(_, _, hit)| hit).collect()
+}
+
+// ---------------------------------------------------------------- documentation
+
+/// What a declaration says about itself: its first line and its comment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Documentation {
+    /// The declaration as written, up to its body.
+    pub header: String,
+    /// The comment above it, without the comment markers.
+    pub comment: String,
+    pub file: PathBuf,
+    pub row: u32,
+}
+
+/// The declaration's text up to where its body starts.
+fn declaration_header(node: Node, src: &str) -> String {
+    let body = node
+        .child_by_field_name("body")
+        .or_else(|| {
+            // A struct or interface: up to its field list.
+            let ty = node.child_by_field_name("type")?;
+            matches!(ty.kind(), "struct_type" | "interface_type").then_some(ty)
+        });
+    let end = match body {
+        Some(body) if body.kind() == "block" => body.start_byte(),
+        Some(ty) => ty.start_byte() + text(ty, src).find('{').map_or(text(ty, src).len(), |ix| ix + 1),
+        None => node.end_byte(),
+    };
+    let header = src[node.start_byte()..end].trim_end();
+    let mut lines = header.lines();
+    let first = lines.next().unwrap_or_default().to_string();
+    // A long value is cut after its first lines.
+    let rest: Vec<&str> = lines.take(5).collect();
+    let mut header = first;
+    for line in rest {
+        header.push('\n');
+        header.push_str(line);
+    }
+    header
+}
+
+/// The `//` comment lines right above line `row`.
+fn comment_above(src: &str, row: usize) -> String {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut start = row;
+    while start > 0 && lines[start - 1].trim_start().starts_with("//") {
+        start -= 1;
+    }
+    lines[start..row]
+        .iter()
+        .map(|line| {
+            let line = line.trim_start().trim_start_matches("//");
+            line.strip_prefix(' ').unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The documentation of what the name at `offset` refers to or declares.
+/// `read` gives the text of other files, as the editor has them.
+pub fn documentation(
+    index: &Index,
+    file: &Path,
+    source: &str,
+    offset: usize,
+    read: &dyn Fn(&Path) -> Option<String>,
+) -> Option<Documentation> {
+    let target = definition(index, file, source, offset)
+        .or_else(|| declaration_at(index, file, source, offset))?;
+    let src = if target.file == file {
+        source.to_string()
+    } else {
+        read(&target.file)?
+    };
+    let tree = parse(&src)?;
+    let at = tree_sitter::Point::new(target.row as usize, target.col as usize);
+    let mut node = tree.root_node().descendant_for_point_range(at, at);
+    while let Some(current) = node {
+        if DECLARATIONS.contains(&current.kind()) {
+            break;
+        }
+        node = current.parent();
+    }
+    let node = node?;
+    // A grouped `var (…)` or `type (…)` keeps its comment on the spec; a
+    // single declaration on the keyword line above it.
+    let mut start = node.start_position().row;
+    if let Some(parent) = node.parent()
+        && matches!(parent.kind(), "type_declaration" | "var_declaration" | "const_declaration")
+        && parent.start_position().row + 1 >= start
+        && text(parent, &src).lines().count() == text(node, &src).lines().count()
+    {
+        start = parent.start_position().row;
+    }
+    let header = if matches!(node.kind(), "type_spec" | "type_alias") {
+        format!("type {}", declaration_header(node, &src))
+    } else if matches!(node.kind(), "var_spec" | "const_spec") {
+        let keyword = if node.kind() == "var_spec" { "var" } else { "const" };
+        format!("{keyword} {}", declaration_header(node, &src))
+    } else {
+        declaration_header(node, &src)
+    };
+    Some(Documentation {
+        header,
+        comment: comment_above(&src, start),
+        file: target.file,
+        row: target.row,
+    })
+}
+
+// ---------------------------------------------------------------- implement
+
+/// Interfaces declared in the packages of `dirs`.
+pub fn interfaces(index: &Index, dirs: &[PathBuf]) -> Vec<SymbolHit> {
+    let mut found: Vec<SymbolHit> = dirs
+        .iter()
+        .flat_map(|dir| [index.package(dir), index.test_package(dir)])
+        .flat_map(|package| {
+            package
+                .symbols
+                .iter()
+                .filter(|s| s.kind == Kind::Type && s.owner.is_none() && s.detail == "interface")
+                .map(|s| SymbolHit {
+                    name: s.name.clone(),
+                    owner: None,
+                    kind: s.kind,
+                    detail: s.detail.clone(),
+                    file: s.file.to_path_buf(),
+                    row: s.row,
+                    col: s.col,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    found.sort_by(|a, b| (&a.name, &a.file).cmp(&(&b.name, &b.file)));
+    found.dedup_by(|a, b| a.name == b.name && a.file == b.file);
+    found
+}
+
+/// The concrete type declared around `offset`, if any.
+pub fn type_at(source: &str, offset: usize) -> Option<String> {
+    let tree = parse(source)?;
+    let mut node = tree.root_node().descendant_for_byte_range(offset, offset);
+    while let Some(current) = node {
+        if current.kind() == "type_spec" {
+            let ty = current.child_by_field_name("type")?;
+            if ty.kind() == "interface_type" {
+                return None;
+            }
+            return Some(text(current.child_by_field_name("name")?, source).to_string());
+        }
+        node = current.parent();
+    }
+    None
+}
+
+/// The parameters and results of the method declared at `row`, `col` of
+/// `file`, as written: `(id string) (int, error)`.
+fn method_signature(file: &Path, row: u32, col: u32) -> Option<String> {
+    let src = std::fs::read_to_string(file).ok()?;
+    let tree = parse(&src)?;
+    let at = tree_sitter::Point::new(row as usize, col as usize);
+    let mut node = tree.root_node().descendant_for_point_range(at, at)?;
+    while !matches!(node.kind(), "method_elem" | "method_spec") {
+        node = node.parent()?;
+    }
+    let parameters = text(node.child_by_field_name("parameters")?, &src).to_string();
+    Some(match node.child_by_field_name("result") {
+        Some(result) => format!("{parameters} {}", text(result, &src)),
+        None => parameters,
+    })
+}
+
+/// `signature` with the names of `types` written as `package.Name`.
+fn qualify(signature: &str, types: &HashSet<String>, package: &str) -> String {
+    let mut out = String::with_capacity(signature.len());
+    let bytes = signature.as_bytes();
+    let mut ix = 0;
+    while ix < signature.len() {
+        if is_ident(bytes[ix]) && (ix == 0 || !is_ident(bytes[ix - 1])) {
+            let end = word_end(signature, ix);
+            let word = &signature[ix..end];
+            let after_dot = ix > 0 && bytes[ix - 1] == b'.';
+            if !after_dot && types.contains(word) {
+                out.push_str(package);
+                out.push('.');
+            }
+            out.push_str(word);
+            ix = end;
+        } else {
+            out.push(signature[ix..].chars().next().unwrap_or(' '));
+            ix += signature[ix..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    out
+}
+
+/// Methods of the interface `interface` (declared in `interface_file`) that
+/// the type `type_name` of `file` lacks, as stubs, and the byte offset after
+/// the type's declaration where they go.
+pub fn implement(
+    index: &Index,
+    file: &Path,
+    source: &str,
+    type_name: &str,
+    interface_file: &Path,
+    interface: &str,
+) -> Option<(usize, String)> {
+    let dir = file.parent()?;
+    let interface_dir = interface_file.parent()?;
+    let wanted: Vec<Symbol> = Scope::for_dir(index, interface_dir)
+        .members(
+            &Ty {
+                text: interface.to_string(),
+                file: Arc::from(interface_file),
+            },
+            MAX_DEPTH,
+        )
+        .into_iter()
+        .filter(|member| member.kind == Kind::Method)
+        .collect();
+
+    let tree = parse(source)?;
+    let (imports, symbols) = file_symbols(source, &tree, &Arc::from(file));
+    let mut existing: HashSet<String> = symbols
+        .iter()
+        .filter(|s| s.kind == Kind::Method && s.owner.as_deref() == Some(type_name))
+        .map(|s| s.name.clone())
+        .collect();
+    existing.extend(
+        Scope::for_dir(index, dir)
+            .package
+            .symbols
+            .iter()
+            .filter(|s| s.kind == Kind::Method && s.owner.as_deref() == Some(type_name))
+            .map(|s| s.name.clone()),
+    );
+
+    // Types of the interface's own package are named through its import.
+    let (package, types) = if interface_dir == dir {
+        (String::new(), HashSet::new())
+    } else {
+        let name = imports
+            .iter()
+            .find(|import| index.resolve_import(dir, &import.path).as_deref() == Some(interface_dir))
+            .map(|import| import.name.clone())
+            .unwrap_or_else(|| {
+                interface_dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        let types = index
+            .package(interface_dir)
+            .symbols
+            .iter()
+            .filter(|s| s.kind == Kind::Type && s.owner.is_none() && exported(&s.name))
+            .map(|s| s.name.clone())
+            .collect();
+        (name, types)
+    };
+
+    let receiver: String = type_name
+        .chars()
+        .next()
+        .map(|ch| ch.to_lowercase().collect())
+        .unwrap_or_else(|| "x".to_string());
+    let mut stubs = String::new();
+    for method in wanted.iter().filter(|method| !existing.contains(&method.name)) {
+        let signature = method_signature(&method.file, method.row, method.col)?;
+        let signature = if package.is_empty() {
+            signature
+        } else {
+            qualify(&signature, &types, &package)
+        };
+        stubs.push_str(&format!(
+            "\n\nfunc ({receiver} *{type_name}) {}{signature} {{\n\tpanic(\"not implemented\")\n}}",
+            method.name
+        ));
+    }
+    if stubs.is_empty() {
+        return None;
+    }
+    // After the declaration of the type.
+    let mut at = None;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for declaration in root.named_children(&mut cursor) {
+        if declaration.kind() != "type_declaration" {
+            continue;
+        }
+        let mut specs = declaration.walk();
+        let declares = declaration.named_children(&mut specs).any(|spec| {
+            spec.child_by_field_name("name")
+                .is_some_and(|name| text(name, source) == type_name)
+        });
+        if declares {
+            at = Some(declaration.end_byte());
+        }
+    }
+    Some((at?, stubs))
 }
 
 #[cfg(test)]
@@ -2388,30 +2769,30 @@ mod tests {
                 GO_MOD,
                 (
                     "main.go",
-                    "package main\n\ntype Room struct {\n\tChips int\n}\n\nfunc main() {\n\tr := Room{Chips: 1}\n\tr.Chips += 2\n}\n",
+                    "package main\n\ntype Counter struct {\n\tValue int\n}\n\nfunc main() {\n\tc := Counter{Value: 1}\n\tc.Value += 2\n}\n",
                 ),
             ],
         );
-        let (_, uses) = fixture.usages("main.go", "Ch|ips int");
+        let (_, uses) = fixture.usages("main.go", "Val|ue int");
         assert_eq!(uses, [at("main.go", 7), at("main.go", 8)]);
     }
 
     #[test]
     fn implementations_of_an_interface_are_found_by_their_methods() {
-        let wallet = "package port\n\ntype Wallet interface {\n\tBalance(id string) (int64, error)\n\tName() string\n}\n";
+        let store = "package port\n\ntype Store interface {\n\tLoad(id string) (int64, error)\n\tName() string\n}\n";
         let fixture = Fixture::new(
             "implementations",
             &[
                 GO_MOD,
-                ("port/port.go", wallet),
+                ("port/port.go", store),
                 (
                     "infra/client.go",
-                    "package infra\n\ntype Client struct{}\n\nfunc (c *Client) Balance(id string) (int64, error) { return 0, nil }\n\nfunc (c Client) Name() string { return \"\" }\n",
+                    "package infra\n\ntype Client struct{}\n\nfunc (c *Client) Load(id string) (int64, error) { return 0, nil }\n\nfunc (c Client) Name() string { return \"\" }\n",
                 ),
                 // A method with another shape does not implement it.
                 (
                     "infra/other.go",
-                    "package infra\n\ntype Other struct{}\n\nfunc (Other) Balance() int64 { return 0 }\n\nfunc (Other) Name() string { return \"\" }\n",
+                    "package infra\n\ntype Other struct{}\n\nfunc (Other) Load() int64 { return 0 }\n\nfunc (Other) Name() string { return \"\" }\n",
                 ),
                 // Methods can come from an embedded type.
                 (
@@ -2419,20 +2800,20 @@ mod tests {
                     "package infra\n\ntype Wrapped struct {\n\t*Client\n}\n",
                 ),
                 (
-                    "game/fake_test.go",
-                    "package game\n\ntype fake struct{}\n\nfunc (fake) Balance(string) (int64, error) { return 0, nil }\nfunc (fake) Name() string { return \"\" }\n",
+                    "service/fake_test.go",
+                    "package service\n\ntype fake struct{}\n\nfunc (fake) Load(string) (int64, error) { return 0, nil }\nfunc (fake) Name() string { return \"\" }\n",
                 ),
             ],
         );
-        let (implementations, _) = fixture.usages("port/port.go", "type |Wallet");
+        let (implementations, _) = fixture.usages("port/port.go", "type |Store");
         assert_eq!(
             implementations,
-            [at("game/fake_test.go", 2), at("infra/client.go", 2), at("infra/wrapped.go", 2)]
+            [at("infra/client.go", 2), at("infra/wrapped.go", 2), at("service/fake_test.go", 2)]
         );
-        let (implementations, _) = fixture.usages("port/port.go", "|Balance(id");
+        let (implementations, _) = fixture.usages("port/port.go", "|Load(id");
         assert_eq!(
             implementations,
-            [at("game/fake_test.go", 4), at("infra/client.go", 4)]
+            [at("infra/client.go", 4), at("service/fake_test.go", 4)]
         );
     }
 
@@ -2463,22 +2844,102 @@ mod tests {
 
     #[test]
     fn the_outline_lists_declarations_with_their_extent() {
-        let source = "package main\n\ntype Room struct {\n\tChips int\n}\n\nfunc (r *Room) Add(n int) {\n\tr.Chips += n\n}\n\nconst Max = 10\n\nfunc main() {\n}\n";
+        let source = "package main\n\ntype Counter struct {\n\tValue int\n}\n\nfunc (c *Counter) Add(n int) {\n\tc.Value += n\n}\n\nconst Max = 10\n\nfunc main() {\n}\n";
         let items = outline(source);
         let names: Vec<(String, u32, u32)> =
             items.iter().map(|i| (i.full_name(), i.row, i.end_row)).collect();
         assert_eq!(
             names,
             [
-                ("Room".to_string(), 2, 4),
-                ("Room.Chips".to_string(), 3, 3),
-                ("Room.Add".to_string(), 6, 8),
+                ("Counter".to_string(), 2, 4),
+                ("Counter.Value".to_string(), 3, 3),
+                ("Counter.Add".to_string(), 6, 8),
                 ("Max".to_string(), 10, 10),
                 ("main".to_string(), 12, 13),
             ]
         );
-        assert_eq!(enclosing(&items, 7).map(OutlineItem::full_name), Some("Room.Add".into()));
-        assert_eq!(enclosing(&items, 3).map(OutlineItem::full_name), Some("Room.Chips".into()));
+        assert_eq!(enclosing(&items, 7).map(OutlineItem::full_name), Some("Counter.Add".into()));
+        assert_eq!(enclosing(&items, 3).map(OutlineItem::full_name), Some("Counter.Value".into()));
         assert_eq!(enclosing(&items, 9), None);
+    }
+
+    #[test]
+    fn symbols_are_found_by_name_across_packages() {
+        let fixture = Fixture::new(
+            "symbols",
+            &[
+                GO_MOD,
+                ("store/store.go", "package store\n\ntype Store struct{}\n\nfunc (s *Store) Load() {}\n\nfunc NewStore() *Store { return nil }\n"),
+                ("main.go", "package main\n\nfunc main() {}\n\nvar storeName = \"x\"\n"),
+            ],
+        );
+        let dirs = vec![fixture.root.clone(), fixture.root.join("store")];
+        let names = |query: &str| -> Vec<String> {
+            find_symbols(&fixture.index, &dirs, query, 10)
+                .into_iter()
+                .map(|hit| match hit.owner {
+                    Some(owner) => format!("{owner}.{}", hit.name),
+                    None => hit.name,
+                })
+                .collect()
+        };
+        assert_eq!(names("Store"), ["Store", "storeName", "NewStore"]);
+        assert_eq!(names("store.lo"), ["Store.Load"]);
+        assert!(names("").is_empty());
+    }
+
+    #[test]
+    fn documentation_reads_the_declaration_and_its_comment() {
+        let fixture = Fixture::new(
+            "documentation",
+            &[
+                GO_MOD,
+                (
+                    "store/store.go",
+                    "package store\n\n// Store keeps items.\n// It is safe for concurrent use.\ntype Store struct {\n\titems map[string]int\n}\n\n// Load returns the item.\nfunc (s *Store) Load(id string) (int, error) {\n\treturn 0, nil\n}\n",
+                ),
+            ],
+        );
+        let source = "package main\n\nimport \"example.com/demo/store\"\n\nfunc main() {\n\tvar s store.Store\n\ts.Load(\"a\")\n}\n";
+        let file = fixture.root.join("main.go");
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        let at = |needle: &str| source.find(needle).unwrap();
+        let doc = documentation(&fixture.index, &file, source, at("Store\n"), &read).unwrap();
+        assert_eq!(doc.header, "type Store struct {");
+        assert_eq!(doc.comment, "Store keeps items.\nIt is safe for concurrent use.");
+        let doc = documentation(&fixture.index, &file, source, at("Load"), &read).unwrap();
+        assert_eq!(doc.header, "func (s *Store) Load(id string) (int, error)");
+        assert_eq!(doc.comment, "Load returns the item.");
+    }
+
+    #[test]
+    fn missing_methods_of_an_interface_are_stubbed_after_the_type() {
+        let fixture = Fixture::new(
+            "implement",
+            &[
+                GO_MOD,
+                (
+                    "port/port.go",
+                    "package port\n\ntype Item struct{}\n\ntype Store interface {\n\tLoad(id string) (Item, error)\n\tSave(item *Item) error\n\tName() string\n}\n",
+                ),
+            ],
+        );
+        let source = "package memory\n\nimport \"example.com/demo/port\"\n\ntype Memory struct{}\n\nfunc (m *Memory) Name() string { return \"\" }\n\nvar _ port.Store\n";
+        let file = fixture.root.join("memory/memory.go");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, source).unwrap();
+        let interface_file = fixture.root.join("port/port.go");
+
+        assert_eq!(type_at(source, source.find("Memory struct").unwrap()).as_deref(), Some("Memory"));
+        let dirs = vec![fixture.root.join("port")];
+        assert_eq!(interfaces(&fixture.index, &dirs).iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Store"]);
+
+        let (at, stubs) = implement(&fixture.index, &file, source, "Memory", &interface_file, "Store").unwrap();
+        assert_eq!(&source[..at], "package memory\n\nimport \"example.com/demo/port\"\n\ntype Memory struct{}");
+        assert_eq!(
+            stubs,
+            "\n\nfunc (m *Memory) Load(id string) (port.Item, error) {\n\tpanic(\"not implemented\")\n}\
+             \n\nfunc (m *Memory) Save(item *port.Item) error {\n\tpanic(\"not implemented\")\n}"
+        );
     }
 }

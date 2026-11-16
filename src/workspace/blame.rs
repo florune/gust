@@ -52,7 +52,7 @@ impl Workspace {
         let row = doc.editor.read(cx).cursor_position().line as usize;
         let entry = doc.blame.get(row)?.as_ref()?;
         Some(if entry.uncommitted() {
-            "你 · 未提交的修改".into()
+            "未提交的修改".into()
         } else {
             format!(
                 "{}, {} · {}",
@@ -66,6 +66,9 @@ impl Workspace {
 
     /// A layer over the editor of the file at `ix` that draws the note.
     pub(super) fn render_blame_layer(&self, ix: usize, cx: &App) -> Option<AnyElement> {
+        if !self.app.blame {
+            return None;
+        }
         let note = self.blame_note(ix, cx)?;
         let editor = self.docs.get(ix)?.editor.clone();
         let theme = cx.theme();

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpui_kit::component::Rope;
-use gpui_kit::component::input::{CompletionProvider, DefinitionProvider};
+use gpui_kit::component::input::{CompletionProvider, DefinitionProvider, HoverProvider};
 use gpui_kit::{App, Task, Window};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
@@ -87,6 +87,49 @@ impl CompletionProvider for GoFile {
             (chars.next(), chars.next()),
             (Some(ch), None) if ch.is_alphanumeric() || ch == '_' || ch == '.'
         )
+    }
+}
+
+/// Whether documentation shows when the pointer rests on a name.
+static HOVER_DOCS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_hover_docs(on: bool) {
+    HOVER_DOCS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl HoverProvider for GoFile {
+    fn hover(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Option<lsp_types::Hover>>> {
+        if !HOVER_DOCS.load(std::sync::atomic::Ordering::Relaxed) {
+            return Task::ready(Ok(None));
+        }
+        let source = text.to_string();
+        let index = self.index.clone();
+        let path = self.path.clone();
+        cx.background_executor().spawn(async move {
+            let read = |file: &Path| std::fs::read_to_string(file).ok();
+            let Some(doc) = goindex::documentation(&index, &path, &source, offset, &read) else {
+                return Ok(None);
+            };
+            // No language on the fence: its label would sit over the code.
+            let mut value = format!("```\n{}\n```", doc.header);
+            if !doc.comment.is_empty() {
+                value.push_str("\n\n");
+                value.push_str(&doc.comment);
+            }
+            Ok(Some(lsp_types::Hover {
+                contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+                    kind: lsp_types::MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            }))
+        })
     }
 }
 

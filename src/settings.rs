@@ -5,6 +5,55 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Settings of the application, the same for every project.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    pub dark: bool,
+    /// Size of the code font, in points.
+    pub font_size: f32,
+    /// Format Go files when they are saved.
+    pub format_on_save: bool,
+    /// Show the author of the caret's line after its end.
+    pub blame: bool,
+    /// Show documentation when the pointer rests on a name.
+    pub hover_docs: bool,
+    /// Shortcuts the user chose, by command; commands not listed keep their defaults.
+    pub keymap: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            dark: true,
+            font_size: 14.,
+            format_on_save: true,
+            blame: true,
+            hover_docs: true,
+            keymap: Default::default(),
+        }
+    }
+}
+
+/// Font sizes the code font can take.
+pub const FONT_SIZES: std::ops::RangeInclusive<f32> = 8.0..=32.0;
+
+fn app_file() -> PathBuf {
+    config_dir().join("settings.json")
+}
+
+pub fn load_app() -> AppSettings {
+    std::fs::read_to_string(app_file())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_app(settings: &AppSettings) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(settings).expect("settings serialize");
+    write(&app_file(), &text).map_err(|err| format!("无法保存设置：{err}"))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectSettings {
@@ -51,10 +100,8 @@ pub fn is_hidden(hidden: &[String], relative: &str) -> bool {
 
 /// Where Gust keeps its own files: `.gust` in the user's home folder.
 ///
-/// Not `%APPDATA%`: Windows gives a program started from inside a packaged
-/// app (such as an AI tool) its own private copy of that folder, so Gust
-/// started from there and Gust started from Explorer would each keep a list
-/// the other cannot see.
+/// Not `%APPDATA%`: Windows redirects that folder for processes started by
+/// packaged apps, which would split the configuration between launches.
 pub fn config_dir() -> PathBuf {
     if cfg!(test) {
         return std::env::temp_dir().join(format!("gust-test-config-{}", std::process::id()));

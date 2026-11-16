@@ -18,7 +18,16 @@ const MAX_RESULTS: usize = 60;
 
 actions!(
     palette,
-    [FindFile, FindText, PalettePrevious, PaletteNext, PaletteConfirm, PaletteClose]
+    [
+        FindFile,
+        FindText,
+        FindSymbol,
+        ReplaceText,
+        PalettePrevious,
+        PaletteNext,
+        PaletteConfirm,
+        PaletteClose
+    ]
 );
 
 pub(super) fn init(cx: &mut App) {
@@ -30,6 +39,9 @@ pub(super) fn init(cx: &mut App) {
         KeyBinding::new("ctrl-p", FindFile, workspace),
         KeyBinding::new("ctrl-shift-n", FindFile, workspace),
         KeyBinding::new("ctrl-shift-f", FindText, workspace),
+        KeyBinding::new("ctrl-n", FindSymbol, workspace),
+        KeyBinding::new("ctrl-shift-r", ReplaceText, workspace),
+        KeyBinding::new("ctrl-alt-shift-n", FindSymbol, workspace),
         KeyBinding::new("up", PalettePrevious, palette),
         KeyBinding::new("down", PaletteNext, palette),
         KeyBinding::new("enter", PaletteConfirm, palette),
@@ -37,7 +49,7 @@ pub(super) fn init(cx: &mut App) {
     ]);
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode {
     Files,
     Text,
@@ -49,6 +61,20 @@ pub(super) enum Mode {
     Recent,
     /// Compile errors and vet findings.
     Problems,
+    /// Declarations across the project, by name.
+    Symbols,
+    /// The versions of a file kept in local history.
+    History,
+    /// Text in files, with what to replace it by.
+    Replace,
+    /// Stashed changes, to bring one back.
+    Stashes,
+    /// What can be done at the caret.
+    Intentions,
+    /// Interfaces of the project, to implement one.
+    Interfaces,
+    /// Commands, by name.
+    Actions,
 }
 
 pub(super) struct Palette {
@@ -59,6 +85,10 @@ pub(super) struct Palette {
     pub title: Option<SharedString>,
     /// Every usage, for [`Mode::Usages`].
     pub found: Vec<Hit>,
+    /// The file whose versions [`Mode::History`] lists.
+    pub history_file: Option<std::path::PathBuf>,
+    /// What the text found is replaced by, for [`Mode::Replace`].
+    pub replacement: Option<Entity<InputState>>,
     pub selected: usize,
     pub scroll: ScrollHandle,
     /// The search in flight; replacing it abandons the previous one.
@@ -84,14 +114,23 @@ impl Workspace {
     pub(super) fn open_palette(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(match mode {
-                Mode::Files => "按文件名查找，也可以粘贴 kafka/consumer.go:159",
+                Mode::Files => "按文件名或 文件:行号 查找",
                 Mode::Text => "在所有文件中查找文字",
                 Mode::Usages => "筛选",
                 Mode::Outline => "按名称筛选",
                 Mode::Recent => "按文件名筛选",
                 Mode::Problems => "筛选",
+                Mode::Symbols => "按名称查找类型、函数、方法、变量",
+                Mode::History => "筛选",
+                Mode::Replace => "在所有文件中查找文字",
+                Mode::Stashes => "筛选",
+                Mode::Intentions => "筛选",
+                Mode::Interfaces => "按名称筛选",
+                Mode::Actions => "输入操作名称",
             })
         });
+        let replacement = (mode == Mode::Replace)
+            .then(|| cx.new(|cx| InputState::new(window, cx).placeholder("替换为")));
         let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.search(cx);
@@ -104,6 +143,8 @@ impl Workspace {
             hits: Vec::new(),
             title: None,
             found: Vec::new(),
+            history_file: None,
+            replacement,
             selected: 0,
             scroll: ScrollHandle::new(),
             search: Task::ready(()),
@@ -133,7 +174,18 @@ impl Workspace {
         };
         let query = palette.input.read(cx).value().to_string();
         let mode = palette.mode;
-        if matches!(mode, Mode::Usages | Mode::Outline | Mode::Recent | Mode::Problems) {
+        if matches!(
+            mode,
+            Mode::Usages
+                | Mode::Outline
+                | Mode::Recent
+                | Mode::Problems
+                | Mode::History
+                | Mode::Stashes
+                | Mode::Intentions
+                | Mode::Interfaces
+                | Mode::Actions
+        ) {
             let query = query.to_lowercase();
             palette.hits = palette
                 .found
@@ -157,9 +209,10 @@ impl Workspace {
         let root = self.root.clone();
         let known = self.project_files.clone();
         let hidden = self.settings.hidden.clone();
+        let index = self.index.clone();
         palette.search = cx.spawn(async move |this, cx| {
             // Reading every file is worth holding off for until typing pauses.
-            if mode == Mode::Text {
+            if matches!(mode, Mode::Text | Mode::Replace) {
                 cx.background_executor()
                     .timer(Duration::from_millis(150))
                     .await;
@@ -168,12 +221,22 @@ impl Workspace {
                 let files =
                     known.unwrap_or_else(|| Arc::new(finder::project_files(&root, &hidden)));
                 let hits = match mode {
-                    Mode::Files | Mode::Usages | Mode::Outline | Mode::Recent | Mode::Problems => {
+                    Mode::Files
+                    | Mode::Usages
+                    | Mode::Outline
+                    | Mode::Recent
+                    | Mode::Problems
+                    | Mode::History
+                    | Mode::Stashes
+                    | Mode::Intentions
+                    | Mode::Interfaces
+                    | Mode::Actions => {
                         finder::find_files(&files, &query, MAX_RESULTS)
                     }
-                    Mode::Text => {
+                    Mode::Text | Mode::Replace => {
                         finder::find_text(&root, &files, &query, MAX_RESULTS, &cancelled)
                     }
+                    Mode::Symbols => find_symbols(&index, &root, &files, &query),
                 };
                 (files, hits, cancelled)
             });
@@ -211,7 +274,45 @@ impl Workspace {
             return;
         };
         let (path, row, col) = (self.root.join(&hit.path), hit.row, hit.col);
-        // A file found with a line, as `consumer.go:159`, opens at that line.
+        // An intention is carried out; an interface is implemented; a
+        // command runs.
+        let mode = self.palette.as_ref().map(|palette| palette.mode);
+        if mode == Some(Mode::Actions) {
+            let ix = hit.path.parse().unwrap_or(usize::MAX);
+            self.palette = None;
+            self.run_command(ix, window, cx);
+            return;
+        }
+        if mode == Some(Mode::Intentions) {
+            let id = hit.path.clone();
+            self.close_palette(window, cx);
+            self.run_intention(&id, window, cx);
+            return;
+        }
+        if mode == Some(Mode::Interfaces) {
+            let (file, name) = (std::path::PathBuf::from(&hit.path), hit.preview.clone());
+            self.close_palette(window, cx);
+            self.implement_interface(file, name, window, cx);
+            return;
+        }
+        // A stash is brought back.
+        if self.palette.as_ref().is_some_and(|palette| palette.mode == Mode::Stashes) {
+            let reference = hit.path.clone();
+            self.close_palette(window, cx);
+            self.unstash(reference, window, cx);
+            return;
+        }
+        // A version of local history opens in a compare view.
+        if let Some(palette) = &self.palette
+            && palette.mode == Mode::History
+            && let Some(file) = palette.history_file.clone()
+        {
+            let version = std::path::PathBuf::from(&hit.path);
+            self.close_palette(window, cx);
+            self.compare_with_version(file, version, window, cx);
+            return;
+        }
+        // A file found with a line opens at that line.
         let text = self
             .palette
             .as_ref()
@@ -257,9 +358,11 @@ impl Workspace {
         }
     }
 
-    /// Any key between the taps makes them not a double tap.
-    pub(super) fn shift_key_down(&mut self, _: &KeyDownEvent, _: &mut Window, _: &mut Context<Self>) {
+    /// Any key between the taps makes them not a double tap; any key closes
+    /// the documentation popup.
+    pub(super) fn shift_key_down(&mut self, _: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.shift_taps = ShiftTaps::default();
+        self.close_quick_doc(cx);
     }
 
     pub(super) fn on_find_file(&mut self, _: &FindFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -268,6 +371,71 @@ impl Workspace {
 
     pub(super) fn on_find_text(&mut self, _: &FindText, window: &mut Window, cx: &mut Context<Self>) {
         self.open_palette(Mode::Text, window, cx);
+    }
+
+    pub(super) fn on_find_symbol(&mut self, _: &FindSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette(Mode::Symbols, window, cx);
+    }
+
+    pub(super) fn on_replace_text(&mut self, _: &ReplaceText, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette(Mode::Replace, window, cx);
+    }
+
+    /// Replace the text searched for in every project file; open files change
+    /// in their editors, others on disk after a local history snapshot.
+    pub(super) fn replace_in_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = &self.palette else {
+            return;
+        };
+        let query = palette.input.read(cx).value().to_string();
+        let Some(replacement) = palette.replacement.as_ref().map(|input| input.read(cx).value().to_string()) else {
+            return;
+        };
+        if query.is_empty() {
+            return;
+        }
+        let files = self
+            .project_files
+            .clone()
+            .unwrap_or_else(|| Arc::new(finder::project_files(&self.root, &self.settings.hidden)));
+        let (mut count, mut changed) = (0, 0);
+        for relative in files.iter() {
+            let path = self.root.join(relative);
+            if let Some(doc) = self.docs.iter().find(|doc| doc.path == path) {
+                let editor = doc.editor.clone();
+                let before = editor.read(cx).text().to_string();
+                let (after, n) = finder::replace_all(&before, &query, &replacement);
+                if n > 0 {
+                    self.apply_as_one_edit(&editor, &before, &after, None, window, cx);
+                    count += n;
+                    changed += 1;
+                }
+                continue;
+            }
+            if !finder::searchable(&path) {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let (after, n) = finder::replace_all(&raw, &query, &replacement);
+            if n == 0 {
+                continue;
+            }
+            self.snapshot_before_change(&path, &raw.replace("\r\n", "\n"), "替换前");
+            match std::fs::write(&path, after) {
+                Ok(()) => {
+                    count += n;
+                    changed += 1;
+                }
+                Err(err) => self.notice = Some(format!("无法写入 {relative}：{err}").into()),
+            }
+        }
+        self.close_palette(window, cx);
+        if self.notice.is_none() {
+            self.notice = Some(format!("已替换 {count} 处，{changed} 个文件").into());
+        }
+        cx.notify();
     }
 
     pub(super) fn on_palette_previous(
@@ -314,11 +482,18 @@ impl Workspace {
             };
             let (title, detail) = match palette.mode {
                 Mode::Files | Mode::Recent => (format!("{name}{}", hit.preview), folder.to_string()),
-                Mode::Text => (hit.preview.clone(), format!("{name}:{}", hit.row + 1)),
-                Mode::Usages | Mode::Problems => {
+                Mode::Text | Mode::Replace => (hit.preview.clone(), format!("{name}:{}", hit.row + 1)),
+                Mode::Usages | Mode::Problems | Mode::Symbols => {
                     (hit.preview.clone(), format!("{}:{}", hit.path, hit.row + 1))
                 }
-                Mode::Outline => (hit.preview.clone(), hit.detail.clone()),
+                Mode::Outline
+                | Mode::History
+                | Mode::Stashes
+                | Mode::Intentions
+                | Mode::Interfaces
+                | Mode::Actions => {
+                    (hit.preview.clone(), hit.detail.clone())
+                }
             };
             h_flex()
                 .id(("palette-row", ix))
@@ -388,10 +563,17 @@ impl Workspace {
                         icon(match palette.mode {
                             Mode::Files => "file-search",
                             Mode::Text => "search",
+                            Mode::Replace => "replace",
+                            Mode::Stashes => "archive",
+                            Mode::Intentions => "lightbulb",
+                            Mode::Interfaces => "braces",
+                            Mode::Actions => "command",
                             Mode::Usages => "list-tree",
                             Mode::Outline => "list",
                             Mode::Recent => "clock",
                             Mode::Problems => "circle-alert",
+                            Mode::Symbols => "braces",
+                            Mode::History => "clock",
                         })
                         .small()
                         .text_color(theme.muted_foreground),
@@ -411,6 +593,31 @@ impl Workspace {
                         )
                     }),
             )
+            .when_some(palette.replacement.clone(), |panel, replacement| {
+                use gpui_kit::component::button::{Button, ButtonVariants as _};
+                panel.child(
+                    h_flex()
+                        .px_3()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(icon("replace").small().text_color(theme.muted_foreground))
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&replacement).appearance(false).bordered(false)),
+                        )
+                        .child(
+                            Button::new("replace-all")
+                                .xsmall()
+                                .primary()
+                                .label("全部替换")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.replace_in_files(window, cx)
+                                })),
+                        ),
+                )
+            })
             .child(
                 v_flex()
                     .id("palette-results")
@@ -449,4 +656,29 @@ impl Workspace {
                 .into_any_element(),
         )
     }
+}
+
+/// Declarations named like `query` in the Go packages among `files`.
+fn find_symbols(index: &crate::goindex::Index, root: &std::path::Path, files: &[String], query: &str) -> Vec<Hit> {
+    let mut dirs: Vec<std::path::PathBuf> = files
+        .iter()
+        .filter(|file| file.ends_with(".go"))
+        .filter_map(|file| root.join(file).parent().map(std::path::Path::to_path_buf))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    crate::goindex::find_symbols(index, &dirs, query, MAX_RESULTS)
+        .into_iter()
+        .map(|symbol| Hit {
+            path: super::relative_path(root, &symbol.file),
+            row: symbol.row,
+            col: symbol.col,
+            preview: match &symbol.owner {
+                Some(owner) => format!("{owner}.{}", symbol.name),
+                None => symbol.name.clone(),
+            },
+            tag: super::outline::kind_label(symbol.kind),
+            detail: symbol.detail,
+        })
+        .collect()
 }

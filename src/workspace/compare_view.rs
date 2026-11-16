@@ -47,6 +47,8 @@ pub(super) enum Source {
     Commit(Commit),
     /// A file as it is on disk against its unsaved edits.
     Disk { file: PathBuf, mine: String },
+    /// A version kept in local history against the file's current text.
+    Version { file: PathBuf, version: PathBuf, current: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,7 +149,7 @@ impl DiffTab {
     pub fn working_path(&self) -> Option<String> {
         match self.source {
             Source::WorkingTree => self.entry().map(|entry| entry.path.clone()),
-            Source::Commit(_) | Source::Disk { .. } => None,
+            Source::Commit(_) | Source::Disk { .. } | Source::Version { .. } => None,
         }
     }
 }
@@ -158,7 +160,7 @@ type Side = Result<String, SharedString>;
 fn side(bytes: Option<Vec<u8>>) -> Side {
     let bytes = bytes.unwrap_or_default();
     if bytes.len() > MAX_BYTES {
-        return Err("文件太大，不做对比".into());
+        return Err("文件过大，无法比较".into());
     }
     if bytes.contains(&0) {
         return Err("二进制文件".into());
@@ -184,11 +186,17 @@ fn read_versions(root: &Path, source: &Source, entry: &Entry) -> (Side, Side, St
                 .flatten();
             (side(old), side(new), "HEAD".into(), "工作区".into())
         }
+        Source::Version { version, current, .. } => (
+            crate::local_history::load(version).ok_or_else(|| "无法读取该版本".into()),
+            Ok(current.clone()),
+            "本地历史".into(),
+            "当前".into(),
+        ),
         Source::Disk { file, mine } => (
             side(std::fs::read(file).ok()),
             Ok(mine.clone()),
-            "磁盘上的版本（外部修改）".into(),
-            "你的修改（未保存）".into(),
+            "磁盘版本".into(),
+            "未保存的修改".into(),
         ),
         Source::Commit(commit) => {
             let parent = commit.parents.first();
@@ -321,6 +329,7 @@ impl Workspace {
             Source::Commit(commit) => format!("{} · ", commit.short()),
             Source::WorkingTree => String::new(),
             Source::Disk { .. } => "冲突 · ".to_string(),
+            Source::Version { .. } => "本地历史 · ".to_string(),
         };
         tab.title = format!("{short}{}", entry.name()).into();
         let source = tab.source.clone();
@@ -682,7 +691,7 @@ impl Workspace {
         let (added, removed) = tab.counts();
         let entry = tab.entry().cloned();
         let open_path = match &tab.source {
-            Source::Disk { file, .. } => Some(file.clone()),
+            Source::Disk { file, .. } | Source::Version { file, .. } => Some(file.clone()),
             _ => entry
                 .as_ref()
                 .filter(|entry| entry.status != 'D')
@@ -700,8 +709,9 @@ impl Workspace {
             }
             (Source::WorkingTree, Some(entry)) => format!("{} · 相对上次提交", entry.path),
             (Source::Disk { .. }, Some(entry)) => {
-                format!("{} · 点中间的箭头，把磁盘上的那一块用到你的版本里", entry.path)
+                format!("{} · 磁盘版本与未保存的修改", entry.path)
             }
+            (Source::Version { .. }, Some(entry)) => format!("{} · 本地历史版本与当前内容", entry.path),
             (_, None) => "没有改动".to_string(),
         };
         let header_button = |id: &'static str, glyph: &'static str, tip: &'static str| {
@@ -739,12 +749,30 @@ impl Workspace {
                     cx.listener(|this, _, window, cx| this.step_change(true, window, cx)),
                 ),
             )
+            .when_some(
+                match &tab.source {
+                    Source::Version { file, version, .. } => Some((file.clone(), version.clone())),
+                    _ => None,
+                },
+                |row, (file, version)| {
+                    use gpui_kit::component::button::{Button, ButtonVariants as _};
+                    row.child(
+                        Button::new("version-restore")
+                            .xsmall()
+                            .primary()
+                            .label("恢复此版本")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.restore_version(&file, &version, window, cx)
+                            })),
+                    )
+                },
+            )
             .when_some(conflict, |row, ix| {
                 use gpui_kit::component::button::{Button, ButtonVariants as _};
                 row.child(
                     Button::new("disk-take-all")
                         .xsmall()
-                        .label("全部用磁盘版本")
+                        .label("全部使用磁盘版本")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.take_disk(ix, window, cx)
                         })),

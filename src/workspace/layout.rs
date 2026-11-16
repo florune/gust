@@ -44,6 +44,7 @@ impl Workspace {
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let branch = self.render_branch(cx);
         let project = self.render_project_menu(cx);
+        let app_menu = self.render_app_menu(cx);
         let theme = cx.theme();
         // Presses on the controls must not start dragging the window.
         let no_drag = |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation();
@@ -53,7 +54,11 @@ impl Workspace {
                 .h_full()
                 .gap_1()
                 .text_size(UI_TEXT)
-                .child(app_logo(px(22.)))
+                .child(
+                    div()
+                        .on_mouse_down(MouseButton::Left, no_drag)
+                        .child(app_menu),
+                )
                 .child(
                     div()
                         .ml_1()
@@ -83,7 +88,7 @@ impl Workspace {
                         .child(icon("search").xsmall())
                         .child(format!("搜索 {}", self.project_name()))
                         .child(div().flex_1())
-                        .child("Ctrl+P")
+                        .child(self.shortcut("find_file"))
                         .on_mouse_down(MouseButton::Left, no_drag)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_palette(Mode::Files, window, cx)
@@ -143,7 +148,7 @@ impl Workspace {
                         })
                         .on_click(move |_, window, cx| {
                             let path = std::path::PathBuf::from(&path);
-                            open.update(cx, |this, cx| this.set_root(path, window, cx))
+                            open.update(cx, |this, cx| this.choose_project(path, window, cx))
                                 .ok();
                         }),
                     );
@@ -165,7 +170,7 @@ impl Workspace {
     fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let changes = self.git.as_ref().map_or(0, |status| status.changes.len());
-        let button = |id: &'static str, name: &'static str, tip: &'static str, active: bool| {
+        let button = |id: &'static str, name: &'static str, tip: SharedString, active: bool| {
             div()
                 .id(id)
                 .relative()
@@ -184,7 +189,7 @@ impl Workspace {
                     this.hover(|this| this.bg(theme.list_hover).text_color(theme.foreground))
                 })
                 .child(icon(name).size(px(18.)))
-                .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         };
         let files = self.sidebar_visible && self.sidebar_tab == SidebarTab::Files;
         let commit = self.sidebar_visible && self.sidebar_tab == SidebarTab::Changes;
@@ -198,11 +203,11 @@ impl Workspace {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .child(button("activity-files", "folder", "项目 (Alt+1)", files).on_click(
+            .child(button("activity-files", "folder", self.tip("项目", "sidebar"), files).on_click(
                 cx.listener(|this, _, _, cx| this.toggle_sidebar_tab(SidebarTab::Files, cx)),
             ))
             .child(
-                button("activity-commit", "git-commit-horizontal", "提交 (Alt+0)", commit)
+                button("activity-commit", "git-commit-horizontal", self.tip("提交", "commit"), commit)
                     .when(changes > 0, |this| {
                         this.child(
                             div()
@@ -235,7 +240,7 @@ impl Workspace {
                 button(
                     "activity-log",
                     "git-graph",
-                    "Git 日志 (Alt+9)",
+                    self.tip("Git 日志", "git_log"),
                     self.terminal_visible && self.bottom_tab == BottomTab::Log,
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -246,7 +251,7 @@ impl Workspace {
                 button(
                     "activity-terminal",
                     "square-terminal",
-                    "终端 (Alt+F12)",
+                    self.tip("终端", "terminal"),
                     self.terminal_visible && self.bottom_tab == BottomTab::Terminal,
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -257,7 +262,7 @@ impl Workspace {
                 button(
                     "activity-theme",
                     if theme.is_dark() { "sun" } else { "moon" },
-                    "切换浅色/深色",
+                    self.tip("切换浅色/深色", "toggle_theme"),
                     false,
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -330,7 +335,7 @@ impl Workspace {
                         if self.tree.read(cx).shows_hidden() {
                             "不显示已隐藏的文件"
                         } else {
-                            "显示已隐藏的文件（右键可取消隐藏）"
+                            "显示已隐藏的文件"
                         },
                         cx,
                     )
@@ -369,7 +374,8 @@ impl Workspace {
 
     fn render_empty_editor(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let row = |label: &'static str, keys: &'static str| {
+        let row = |label: &'static str, id: &str| {
+            let keys = self.shortcut(id);
             h_flex()
                 .w(px(300.))
                 .h(px(28.))
@@ -394,12 +400,12 @@ impl Workspace {
             .child(
                 div().mb_6().opacity(0.85).child(app_logo(px(64.))),
             )
-            .child(row("搜索文件", "Ctrl+P"))
-            .child(row("全局搜索", "Ctrl+Shift+F"))
-            .child(row("终端", "Alt+F12"))
-            .child(row("提交", "Alt+0"))
-            .child(row("Git 日志", "Alt+9"))
-            .child(row("打开文件夹", "Ctrl+O"))
+            .child(row("搜索文件", "find_file"))
+            .child(row("全局搜索", "find_text"))
+            .child(row("终端", "terminal"))
+            .child(row("提交", "commit"))
+            .child(row("Git 日志", "git_log"))
+            .child(row("打开文件夹", "open_folder"))
             .into_any_element()
     }
 
@@ -682,7 +688,7 @@ impl Workspace {
                                     .child(warnings.to_string()),
                             )
                         })
-                        .tooltip(|window, cx| Tooltip::new("问题 (Alt+6)，F2 跳到下一个").build(window, cx))
+                        .tooltip(|window, cx| Tooltip::new("问题 (Alt+6)").build(window, cx))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.on_show_problems(&super::problems_view::ShowProblems, window, cx)
                         })),
@@ -729,6 +735,13 @@ impl Render for Workspace {
         let run_configs = self.render_run_configs(cx);
         let file_prompt = self.render_file_prompt(cx);
         let hunk = self.render_hunk(cx);
+        let project_choice = self.render_project_choice(cx);
+        let quick_doc = self.render_quick_doc(cx);
+        let settings_page = self.render_settings_page(cx);
+        let keymap_page = self.render_keymap_page(cx);
+        let about = self.render_about(cx);
+        let merge_dialog = self.render_merge_dialog(cx);
+        let zoom = self.render_zoom_listener(cx);
         let autoscroll = self.render_autoscroll(cx);
         let sidebar = self.render_sidebar(cx);
         let center = self.render_center(cx);
@@ -762,6 +775,25 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_recent_files))
             .on_action(cx.listener(Self::on_next_problem))
             .on_action(cx.listener(Self::on_rollback_lines))
+            .on_action(cx.listener(Self::on_open_here))
+            .on_action(cx.listener(Self::on_quick_documentation))
+            .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_open_keymap))
+            .on_action(cx.listener(Self::on_show_about))
+            .on_action(cx.listener(Self::on_show_intentions))
+            .on_action(cx.listener(Self::on_tab_or_template))
+            .on_action(cx.listener(Self::on_find_action))
+            .on_action(cx.listener(Self::on_close_merge_dialog))
+            .on_action(cx.listener(Self::on_go_mod_tidy))
+            .on_action(cx.listener(Self::on_new_branch))
+            .on_action(cx.listener(Self::on_stash_changes))
+            .on_action(cx.listener(Self::on_unstash_changes))
+            .on_action(cx.listener(Self::on_show_local_history))
+            .on_action(cx.listener(Self::on_close_settings))
+            .on_action(cx.listener(Self::on_run_test_at_caret))
+            .on_action(cx.listener(Self::on_rename_symbol))
+            .on_action(cx.listener(Self::on_open_in_new_window))
+            .on_action(cx.listener(Self::on_cancel_open))
             .on_action(cx.listener(Self::on_previous_problem))
             .on_action(cx.listener(Self::on_show_problems))
             .on_action(cx.listener(Self::on_confirm_file_prompt))
@@ -791,6 +823,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_close_search))
             .on_action(cx.listener(Self::on_find_file))
             .on_action(cx.listener(Self::on_find_text))
+            .on_action(cx.listener(Self::on_find_symbol))
+            .on_action(cx.listener(Self::on_replace_text))
             .on_action(cx.listener(Self::on_palette_previous))
             .on_action(cx.listener(Self::on_palette_next))
             .on_action(cx.listener(Self::on_palette_confirm))
@@ -838,6 +872,13 @@ impl Render for Workspace {
             .children(palette)
             .children(run_configs)
             .children(hunk)
+            .children(project_choice)
+            .children(quick_doc)
+            .children(settings_page)
+            .children(keymap_page)
+            .children(about)
+            .children(merge_dialog)
+            .child(zoom)
             .children(file_prompt)
             .children(autoscroll)
     }

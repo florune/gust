@@ -8,6 +8,7 @@ use std::sync::Arc;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -796,12 +797,25 @@ impl Workspace {
                             }),
                     )
                     .when(!commit.refs.is_empty(), |this| {
+                        // Text that can be selected and copied: branch names run long.
+                        let names: Vec<String> = commit
+                            .refs
+                            .iter()
+                            .map(|reference| match reference {
+                                Ref::Head(branch) => format!("当前分支 `{branch}`"),
+                                Ref::Detached => "HEAD（游离）".to_string(),
+                                Ref::Local(name) if log.remotes.contains(name) => format!("远程分支 `{name}`"),
+                                Ref::Local(name) => format!("本地分支 `{name}`"),
+                                Ref::Tag(tag) => format!("标签 `{tag}`"),
+                            })
+                            .collect();
                         this.child(
-                            h_flex().flex_wrap().gap_1().children(
-                                commit
-                                    .refs
-                                    .iter()
-                                    .filter_map(|reference| ref_chip(reference, &log.remotes, cx)),
+                            div().text_size(UI_SMALL).child(
+                                TextView::markdown(
+                                    SharedString::from(format!("commit-refs-{}", commit.hash)),
+                                    names.join("  \n"),
+                                )
+                                .selectable(true),
                             ),
                         )
                     }),
@@ -855,7 +869,7 @@ impl Workspace {
                 .child(if log.loading {
                     "正在读取历史…"
                 } else if log.commits.is_empty() {
-                    "还没有提交"
+                    "暂无提交"
                 } else {
                     "没有匹配的提交"
                 })

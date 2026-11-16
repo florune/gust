@@ -58,7 +58,9 @@ pub(super) struct RunState {
     build: Task<()>,
     cancel: Arc<AtomicBool>,
     /// The folder the program ran in: output paths are read from there.
-    base: PathBuf,
+    pub(super) base: PathBuf,
+    /// The tests run last, when the last run was of tests.
+    pub(super) last_test: Option<super::test_runner::TestTarget>,
     pub editor: Option<ConfigEditor>,
     _subscription: Option<Subscription>,
 }
@@ -72,6 +74,7 @@ impl RunState {
             build: Task::ready(()),
             cancel: Arc::new(AtomicBool::new(false)),
             base: PathBuf::new(),
+            last_test: None,
             editor: None,
             _subscription: None,
         }
@@ -94,18 +97,41 @@ pub(super) struct ConfigEditor {
     output: Entity<InputState>,
     env: Entity<TextareaState>,
     focus: FocusHandle,
+    /// The project root, which paths in the form are read from.
+    root: PathBuf,
+    /// Where the program runs when the form leaves the folder empty.
+    default_dir: SharedString,
+    _package_changed: Option<Subscription>,
 }
 
 impl ConfigEditor {
-    fn fields(&self) -> [(&'static str, &Entity<InputState>, &'static str); 6] {
+    fn fields(&self) -> [(&'static str, &Entity<InputState>, String); 6] {
         [
-            ("名称", &self.name, ""),
-            ("包路径", &self.package, "从项目根目录算起，如 . 或 ./cmd/server"),
-            ("工作目录", &self.dir, "程序在哪里运行；空着就是项目根目录"),
-            ("程序参数", &self.args, "如 -c config.yaml -port 8080"),
-            ("构建参数", &self.build_flags, "可选，如 -race 或 -tags dev"),
-            ("输出文件", &self.output, "可选；空着就编译到临时目录"),
+            ("名称", &self.name, String::new()),
+            (
+                "包路径",
+                &self.package,
+                "相对于项目根目录".to_string(),
+            ),
+            (
+                "工作目录",
+                &self.dir,
+                format!("默认：{}", self.default_dir),
+            ),
+            ("程序参数", &self.args, String::new()),
+            ("构建参数", &self.build_flags, "传给 go build".to_string()),
+            ("输出文件", &self.output, "默认：临时目录".to_string()),
         ]
+    }
+
+    /// Work out again where the program runs by default, for the package typed.
+    fn refresh_default_dir(&mut self, cx: &App) {
+        let config = RunConfig {
+            package: self.package.read(cx).value().to_string(),
+            dir: String::new(),
+            ..Default::default()
+        };
+        self.default_dir = config.work_dir(&self.root).to_string_lossy().into_owned().into();
     }
 
     /// The form's values, written into the selected configuration.
@@ -247,7 +273,7 @@ impl Workspace {
     }
 
     /// The console, made the first time something runs.
-    fn console(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TerminalView> {
+    pub(super) fn console(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TerminalView> {
         if let Some(console) = &self.run.console {
             return console.clone();
         }
@@ -283,11 +309,12 @@ impl Workspace {
         let console = self.console(window, cx);
         console.update(cx, |console, cx| {
             // A fresh screen and history for each run.
-            console.print("\x1b[3J\x1b[2J\x1b[H", cx);
-            console.print(&format!("{DIM}$ {}{RESET}\n", command.display()), cx);
+            console.print("\x1b[2J\x1b[3J\x1b[H", cx);
+            console.print(&format!("{DIM}{}{RESET}\n", command.display_in(&root)), cx);
         });
         self.run.title = config.name.clone().into();
         self.run.base = config.run(&root).dir;
+        self.run.last_test = None;
         self.run.phase = Phase::Building;
         self.terminal_visible = true;
         self.bottom_tab = BottomTab::Run;
@@ -343,7 +370,7 @@ impl Workspace {
                 let command = config.run(&root);
                 let started = console.update(cx, |console, cx| {
                     console.print(&output, cx);
-                    console.print(&format!("{DIM}$ {}{RESET}\n", command.display()), cx);
+                    console.print(&format!("{DIM}{}{RESET}\n", command.display_in(&root)), cx);
                     console.start(&command, cx)
                 });
                 match started {
@@ -365,11 +392,17 @@ impl Workspace {
             return;
         }
         self.run.phase = Phase::Exited(code);
+        let tests = self.run.last_test.is_some();
         if let Some(console) = &self.run.console {
-            let code = code.map_or("未知".to_string(), |code| code.to_string());
-            console.update(cx, |console, cx| {
-                console.print(&format!("\n{DIM}进程已结束，退出代码 {code}{RESET}\n"), cx)
-            });
+            let line = match (tests, code) {
+                (true, Some(0)) => format!("\n{GREEN}测试通过{RESET}\n"),
+                (true, _) => format!("\n{RED}测试失败{RESET}\n"),
+                (false, code) => {
+                    let code = code.map_or("未知".to_string(), |code| code.to_string());
+                    format!("\n{DIM}进程已结束，退出代码 {code}{RESET}\n")
+                }
+            };
+            console.update(cx, |console, cx| console.print(&line, cx));
         }
         cx.notify();
     }
@@ -429,17 +462,30 @@ impl Workspace {
             output: input("", window, cx),
             env: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("每行一个，如 APP_ENV=dev")
+                    .placeholder("KEY=VALUE，每行一个")
                     .rows(4)
             }),
             focus: cx.focus_handle(),
+            root: self.root.clone(),
+            default_dir: SharedString::default(),
+            _package_changed: None,
         };
+        // The default folder follows the package as it is typed.
+        editor._package_changed = Some(cx.subscribe(&editor.package, |this, _, event: &gpui_kit::component::input::InputEvent, cx| {
+            if matches!(event, gpui_kit::component::input::InputEvent::Change)
+                && let Some(editor) = &mut this.run.editor
+            {
+                editor.refresh_default_dir(cx);
+                cx.notify();
+            }
+        }));
         if add || editor.configs.is_empty() {
             editor.configs.push(self.new_run_config(&editor.configs));
             editor.selected = editor.configs.len() - 1;
         }
         let selected = editor.selected.min(editor.configs.len() - 1);
         editor.load(selected, window, cx);
+        editor.refresh_default_dir(cx);
         editor.name.update(cx, |input, cx| input.focus(window, cx));
         self.run.editor = Some(editor);
         cx.notify();
@@ -458,7 +504,15 @@ impl Workspace {
             .and_then(|dir| dir.strip_prefix(&self.root).ok())
             .map(|dir| dir.to_string_lossy().replace('\\', "/"))
             .filter(|dir| !dir.is_empty())
-            .map_or(".".to_string(), |dir| format!("./{dir}"));
+            .map(|dir| format!("./{dir}"))
+            // Otherwise the module with a `main` package, wherever it sits.
+            .or_else(|| {
+                let (module, _) = run::module_for(&self.root, ".")?;
+                let inside = module.strip_prefix(&self.root).ok()?;
+                (!inside.as_os_str().is_empty())
+                    .then(|| format!("./{}", inside.to_string_lossy().replace('\\', "/")))
+            })
+            .unwrap_or_else(|| ".".to_string());
         let base = package
             .rsplit('/')
             .next()
@@ -627,17 +681,17 @@ impl Workspace {
                     "run-start",
                     if busy { "rotate-cw" } else { "play" },
                     colors.green,
-                    format!("{} '{name}' (Shift+F10)", if busy { "重新运行" } else { "运行" }).into(),
+                    self.tip(&format!("{} '{name}'", if busy { "重新运行" } else { "运行" }), "run"),
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.start_run(false, window, cx))),
             )
             .child(
-                button("run-build", "hammer", theme.muted_foreground, "编译 (Ctrl+F9)".into())
+                button("run-build", "hammer", theme.muted_foreground, self.tip("编译", "build"))
                     .on_click(cx.listener(|this, _, window, cx| this.start_run(true, window, cx))),
             )
             .when(busy, |bar| {
                 bar.child(
-                    button("run-stop", "square", colors.red, "停止 (Ctrl+F2)".into())
+                    button("run-stop", "square", colors.red, self.tip("停止", "stop"))
                         .on_click(cx.listener(|this, _, _, cx| this.stop_run(cx))),
                 )
             })
@@ -669,8 +723,12 @@ impl Workspace {
                     .child(text),
             )
             .child(
-                Self::header_button("console-rerun", "rotate-cw", "重新运行 (Shift+F10)", cx)
-                    .on_click(cx.listener(|this, _, window, cx| this.start_run(false, window, cx))),
+                Self::header_button("console-rerun", "rotate-cw", "重新运行", cx).on_click(
+                    cx.listener(|this, _, window, cx| match this.run.last_test.clone() {
+                        Some(target) => this.run_test(target, window, cx),
+                        None => this.start_run(false, window, cx),
+                    }),
+                ),
             )
             .when(busy, |bar| {
                 bar.child(
@@ -831,7 +889,7 @@ impl Workspace {
                                 .p_4()
                                 .text_size(UI_TEXT)
                                 .text_color(theme.muted_foreground)
-                                .child("没有运行配置，点左下角的 + 新建一个"),
+                                .child("没有运行配置"),
                         )
                     }),
             )

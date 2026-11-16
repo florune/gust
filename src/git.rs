@@ -262,25 +262,107 @@ pub fn rollback(root: &Path, change: &Change) -> Result<(), String> {
     }
 }
 
-/// Commit the working-tree state of `paths`, and nothing else.
-pub fn commit(root: &Path, message: &str, paths: &[String]) -> Result<(), String> {
+/// Commit the working-tree state of `paths`, and nothing else. With
+/// `amend`, the last commit is replaced; it may then take no paths at all,
+/// to change only its message.
+pub fn commit(root: &Path, message: &str, paths: &[String], amend: bool) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("请填写提交说明".to_string());
     }
-    if paths.is_empty() {
+    if paths.is_empty() && !amend {
         return Err("没有勾选要提交的文件".to_string());
     }
     let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
     // New and deleted files have to be known to the index before a commit
     // limited to paths will take them.
-    let mut add = vec!["add", "--all", "--"];
-    add.extend(&paths);
-    git(root, &add)?;
-    let mut commit = vec!["commit", "--quiet", "-m", message, "--"];
-    commit.extend(&paths);
+    if !paths.is_empty() {
+        let mut add = vec!["add", "--all", "--"];
+        add.extend(&paths);
+        git(root, &add)?;
+    }
+    let mut commit = vec!["commit", "--quiet", "-m", message];
+    if amend {
+        commit.push("--amend");
+    }
+    if !paths.is_empty() {
+        commit.push("--");
+        commit.extend(&paths);
+    }
     git(root, &commit).map(|_| ())
 }
 
+/// The full message of the last commit.
+pub fn last_message(root: &Path) -> Option<String> {
+    git(root, &["log", "-1", "--format=%B"])
+        .ok()
+        .map(|message| message.trim_end().to_string())
+}
+
+/// Make a branch from what is checked out, and switch to it.
+pub fn create_branch(root: &Path, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("请填写分支名称".to_string());
+    }
+    git(root, &["switch", "--quiet", "-c", name]).map(|_| ())
+}
+
+/// A stash entry: its reference, as `stash@{0}`, and its message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stash {
+    pub reference: String,
+    pub message: String,
+}
+
+/// Put the uncommitted changes, new files included, aside.
+pub fn stash(root: &Path, message: &str) -> Result<(), String> {
+    let mut args = vec!["stash", "push", "--quiet", "--include-untracked"];
+    let message = message.trim();
+    if !message.is_empty() {
+        args.extend(["-m", message]);
+    }
+    git(root, &args).map(|_| ())
+}
+
+pub fn stashes(root: &Path) -> Vec<Stash> {
+    git(root, &["stash", "list", "--format=%gd%x00%gs"])
+        .map(|output| {
+            output
+                .lines()
+                .filter_map(|line| {
+                    let (reference, message) = line.split_once('\0')?;
+                    Some(Stash {
+                        reference: reference.to_string(),
+                        message: message.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve a conflicted file by taking one whole side: the current
+/// (`ours`) or the incoming one.
+pub fn take_side(root: &Path, path: &str, ours: bool) -> Result<(), String> {
+    let side = if ours { "--ours" } else { "--theirs" };
+    match git(root, &["checkout", side, "--", path]) {
+        Ok(_) => mark_resolved(root, path),
+        // The side deleted the file: resolving takes the deletion.
+        Err(_) => git(root, &["rm", "--quiet", "--", path]).map(|_| ()),
+    }
+}
+
+/// Record a conflicted file as resolved.
+pub fn mark_resolved(root: &Path, path: &str) -> Result<(), String> {
+    git(root, &["add", "--", path]).map(|_| ())
+}
+
+/// Bring a stash back and drop it.
+pub fn unstash(root: &Path, reference: &str) -> Result<(), String> {
+    git(root, &["stash", "pop", "--quiet", reference]).map(|_| ())
+}
+
+/// Local branches, by short name.
 pub fn branches(root: &Path) -> Vec<String> {
     git(root, &["branch", "--format=%(refname:short)"])
         .map(|output| output.lines().map(str::to_string).collect())
@@ -383,17 +465,46 @@ mod tests {
     }
 
     #[test]
+    fn amend_stash_and_branches() {
+        let repo = Repo::new("amend");
+        // Amending with no paths changes only the message.
+        commit(&repo.0, "first, reworded", &[], true).unwrap();
+        assert_eq!(last_message(&repo.0).as_deref(), Some("first, reworded"));
+        assert_eq!(
+            git(&repo.0, &["rev-list", "--count", "HEAD"]).unwrap().trim(),
+            "1"
+        );
+
+        repo.write("a.txt", "stashed\n");
+        repo.write("new.txt", "new\n");
+        stash(&repo.0, "work in progress").unwrap();
+        assert!(repo.status().changes.is_empty());
+        let list = stashes(&repo.0);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].reference, "stash@{0}");
+        assert!(list[0].message.ends_with("work in progress"), "{:?}", list[0]);
+        unstash(&repo.0, &list[0].reference).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.0.join("new.txt")).unwrap(), "new\n");
+        assert!(stashes(&repo.0).is_empty());
+
+        create_branch(&repo.0, "feature/x").unwrap();
+        assert_eq!(repo.status().branch, "feature/x");
+        assert!(create_branch(&repo.0, " ").is_err());
+    }
+
+    #[test]
     fn committing_takes_only_the_chosen_paths() {
         let repo = Repo::new("commit");
         repo.write("a.txt", "changed\n");
         std::fs::remove_file(repo.0.join("b.txt")).unwrap();
         repo.write("new.txt", "fresh\n");
 
-        assert!(commit(&repo.0, "  ", &["a.txt".to_string()]).is_err());
+        assert!(commit(&repo.0, "  ", &["a.txt".to_string()], false).is_err());
         commit(
             &repo.0,
             "second",
             &["a.txt".to_string(), "new.txt".to_string()],
+            false,
         )
         .unwrap();
 

@@ -17,30 +17,50 @@ use crate::format;
 use crate::git;
 use crate::goindex::Index;
 use crate::lang;
+use crate::local_history;
 use crate::settings::{self, ProjectSettings};
 use crate::terminal::{TerminalEvent, TerminalView};
 
+mod action_search;
+mod app_menu;
 mod autoscroll;
 mod blame;
 mod changes;
 mod compare_view;
 mod file_ops;
+mod history_view;
+mod intentions;
+mod keymap_view;
+mod commands;
 mod conflict;
 mod editing;
 mod layout;
 mod log;
 mod markdown;
+mod merge_view;
 mod navigation;
 mod outline;
 mod palette;
 mod problems_view;
+mod quick_doc;
+mod rename_symbol;
 mod rollback;
 mod run_panel;
 mod selection;
 mod session;
+mod settings_view;
 mod split;
 mod tabs;
+mod test_runner;
 mod usages;
+mod windows;
+
+pub use windows::open_window;
+
+/// Bind the shortcuts the user chose in place of the defaults.
+pub fn apply_keymap(keymap: &std::collections::BTreeMap<String, Vec<String>>, cx: &mut App) {
+    commands::apply_keymap(keymap, &Default::default(), cx);
+}
 
 use changes::SidebarTab;
 use compare_view::DiffTab;
@@ -97,6 +117,16 @@ pub fn init(cx: &mut App) {
     editing::init(cx);
     problems_view::init(cx);
     rollback::init(cx);
+    quick_doc::init(cx);
+    test_runner::init(cx);
+    rename_symbol::init(cx);
+    settings_view::init(cx);
+    keymap_view::init(cx);
+    app_menu::init(cx);
+    intentions::init(cx);
+    action_search::init(cx);
+    merge_view::init(cx);
+    windows::init(cx);
     run_panel::init(cx);
 }
 
@@ -190,6 +220,28 @@ pub struct Workspace {
     problems: problems_view::Problems,
     /// The committed lines of a change, shown after a click on its mark.
     hunk: Option<rollback::Hunk>,
+    /// A project to open, waiting for: this window or a new one?
+    project_choice: Option<windows::ProjectChoice>,
+    /// The documentation popup of Ctrl+Q.
+    quick_doc: Option<quick_doc::QuickDoc>,
+    /// Settings of the application, the same for every project.
+    app: settings::AppSettings,
+    /// The settings page, while it is open.
+    settings_page: Option<FocusHandle>,
+    /// The shortcuts page, while it is open.
+    keymap_page: Option<keymap_view::KeymapPage>,
+    /// The About box, while it is open.
+    about: Option<FocusHandle>,
+    /// Wheel movement with Ctrl not yet large enough to change the font size.
+    zoom_remainder: f32,
+    /// The next commit replaces the last one.
+    amend: bool,
+    /// The file and caret Alt+Enter was pressed at.
+    intention_target: Option<(PathBuf, usize)>,
+    /// What had the keyboard when Find Action opened.
+    action_focus: Option<FocusHandle>,
+    /// The list of conflicted files and the merge window, while open.
+    merge_dialog: Option<merge_view::MergeDialog>,
     /// The project's files, listed once and kept until something changes on disk.
     project_files: Option<Arc<Vec<String>>>,
     terminals: Vec<TerminalTab>,
@@ -242,6 +294,7 @@ impl Workspace {
                     FileTreeEvent::Delete(path) => {
                         this.open_file_prompt(file_ops::FileAction::Delete(path.clone()), window, cx)
                     }
+                    FileTreeEvent::History(path) => this.show_local_history(path.clone(), window, cx),
                 },
             ),
             // Like GoLand: leaving the window saves, so tools outside it see
@@ -317,6 +370,17 @@ impl Workspace {
             recent_files: Vec::new(),
             problems: Default::default(),
             hunk: None,
+            project_choice: None,
+            quick_doc: None,
+            app: settings::load_app(),
+            settings_page: None,
+            keymap_page: None,
+            about: None,
+            zoom_remainder: 0.,
+            amend: false,
+            intention_target: None,
+            action_focus: None,
+            merge_dialog: None,
             project_files: None,
             terminals: Vec::new(),
             active_terminal: 0,
@@ -344,8 +408,7 @@ impl Workspace {
         this
     }
 
-    /// Follow changes made to the folder by anything else: an AI agent in the
-    /// terminal, git, a build.
+    /// Follow changes made to the folder by other programs.
     fn watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use notify::Watcher as _;
 
@@ -409,7 +472,7 @@ impl Workspace {
         });
     }
 
-    fn files_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn files_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.project_files = None;
         self.tree.update(cx, |tree, cx| {
             tree.reload();
@@ -448,6 +511,11 @@ impl Workspace {
             }
             return;
         }
+        local_history::record(&self.root, &doc.path, &doc.saved, "外部修改前");
+        if doc.dirty {
+            local_history::record(&self.root, &doc.path, &mine, "未保存的修改");
+        }
+        let doc = &mut self.docs[ix];
         if doc.dirty {
             // Neither side is dropped: the user decides.
             doc.conflict = Some(on_disk);
@@ -618,6 +686,7 @@ impl Workspace {
         editor.update(cx, |editor, _| {
             let lsp = editor.lsp_mut();
             lsp.completion_provider = Some(go.clone());
+            lsp.hover_provider = Some(go.clone());
             lsp.definition_provider = Some(go);
             lsp.completion_menu.max_width = px(560.);
             lsp.set_completion_highlighter(Rc::new(highlight_characters));
@@ -751,6 +820,12 @@ impl Workspace {
             return;
         };
         let text = doc.editor.read(cx).text().to_string();
+        if doc.saved != text {
+            local_history::record(&self.root, &doc.path, &doc.saved, "保存前");
+        }
+        let Some(doc) = self.docs.get_mut(ix) else {
+            return;
+        };
         let on_disk = if doc.crlf {
             text.replace('\n', "\r\n")
         } else {
@@ -763,7 +838,9 @@ impl Workspace {
                 // Saving on purpose keeps these edits over the disk's.
                 doc.conflict = None;
                 let saved = doc.path.clone();
+                let written = doc.saved.clone();
                 self.check_package(&saved, cx);
+                self.stage_if_resolved(&saved, &written, cx);
                 self.refresh_git(cx);
             }
             Err(err) => self.notice = Some(format!("保存失败：{err}").into()),
@@ -832,7 +909,7 @@ impl Workspace {
         // A file in conflict stays open until the user picks a side.
         if self.docs[ix].conflict.is_some() {
             self.activate(ix, window, cx);
-            self.notice = Some(format!("{} 有冲突，先选保留哪个版本", self.docs[ix].title).into());
+            self.notice = Some(format!("{} 存在未解决的冲突", self.docs[ix].title).into());
             cx.notify();
             return;
         }
@@ -997,7 +1074,11 @@ impl Workspace {
 
     fn on_save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.active {
-            self.format_doc(ix, true, window, cx);
+            if self.app.format_on_save {
+                self.format_doc(ix, true, window, cx);
+            } else {
+                self.write_doc(ix, cx);
+            }
         }
     }
 
@@ -1035,7 +1116,8 @@ impl Workspace {
         } else {
             ThemeMode::Dark
         };
-        crate::theme::change(mode, cx);
+        let dark = mode == ThemeMode::Dark;
+        self.change_app_settings(cx, |app| app.dark = dark);
     }
 
     fn on_open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
@@ -1049,7 +1131,7 @@ impl Workspace {
             if let Ok(Ok(Some(paths))) = paths.await
                 && let Some(root) = paths.into_iter().next()
             {
-                this.update_in(cx, |this, window, cx| this.set_root(root, window, cx))
+                this.update_in(cx, |this, window, cx| this.choose_project(root, window, cx))
                     .ok();
             }
         })
