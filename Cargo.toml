@@ -1,8 +1,13 @@
 [package]
 name = "gust"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "A lightweight Go IDE for the AI coding era"
+license = "Apache-2.0"
+repository = "https://github.com/florune/gust"
+readme = "README.md"
+keywords = ["go", "golang", "ide", "editor", "gpui"]
+categories = ["development-tools", "text-editors"]
 
 [dependencies]
 gpui-kit = { version = "0.9.1", features = [
