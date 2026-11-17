@@ -2593,7 +2593,7 @@ fn files_compare_across_worktrees_and_new_ones_get_their_own_settings(cx: &mut T
 
     // The open file against its copy in the other worktree; a click takes its lines.
     let names: Vec<String> = fixture.workspace.read_with(cx, |workspace, _| {
-        workspace.other_worktrees().into_iter().map(|(name, _)| name).collect()
+        workspace.other_worktrees().into_iter().map(|(name, _, _)| name).collect()
     });
     assert_eq!(names, ["other"]);
     let file = fixture.root.join("a.txt");

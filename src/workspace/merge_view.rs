@@ -347,7 +347,7 @@ impl Workspace {
         v_flex()
             .id("merge-dialog")
             .w(px(720.))
-            .max_h(px(560.))
+            .max_h(relative(0.85))
             .bg(theme.popover)
             .border_1()
             .border_color(theme.border)

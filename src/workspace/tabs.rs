@@ -9,7 +9,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{SidebarTab, Workspace, relative_path};
-use crate::ui::{UI_TEXT, file_icon, icon};
+use crate::ui::{UI_SMALL, UI_TEXT, file_icon, icon};
 
 const TAB_HEIGHT: f32 = 36.;
 
@@ -162,6 +162,7 @@ impl Workspace {
         cx.notify();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn tab_menu(
         menu: PopupMenu,
         workspace: WeakEntity<Self>,
@@ -169,7 +170,10 @@ impl Workspace {
         relative: String,
         has_right: bool,
         has_others: bool,
-        worktrees: Vec<(String, PathBuf)>,
+        worktrees: Vec<(String, String, PathBuf)>,
+        checkout: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let act = |label: &'static str,
                    enabled: bool,
@@ -211,24 +215,157 @@ impl Workspace {
         .item(act("本地历史…", true, |this, path, window, cx| {
             this.show_local_history(path.to_path_buf(), window, cx)
         }))
-        .when(!worktrees.is_empty(), |menu| {
-            let mut menu = menu.separator();
-            for (name, root) in worktrees {
+        .when_some(
+            {
+                // Only the worktrees that have this file.
+                let inside = path.strip_prefix(&checkout).ok().map(Path::to_path_buf);
+                inside.and_then(|inside| {
+                    let found: Vec<_> = worktrees
+                        .into_iter()
+                        .filter(|(_, _, root)| root.join(&inside).is_file())
+                        .collect();
+                    (!found.is_empty()).then_some(found)
+                })
+            },
+            |menu, found| {
                 let workspace = workspace.clone();
                 let path = path.clone();
-                let label = format!("与工作树 {name} 中的版本比较");
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    let (path, root, name) = (path.clone(), root.clone(), name.clone());
-                    workspace
-                        .update(cx, |this, cx| this.compare_with_worktree(&path, &root, name, window, cx))
-                        .ok();
-                }));
-            }
-            menu
-        })
+                menu.separator().submenu("与其他工作树比较", window, cx, move |menu, window, _| {
+                    let mut menu = Self::long_menu(menu, window).min_w(px(240.)).max_w(px(520.));
+                    for (name, branch, root) in &found {
+                        let workspace = workspace.clone();
+                        let (path, root, name) = (path.clone(), root.clone(), name.clone());
+                        let (shown, branch) = (name.clone(), branch.clone());
+                        let row = move |_: &mut Window, cx: &mut App| {
+                            let theme = cx.theme();
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .child(div().flex_shrink_0().child(shown.clone()))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(UI_SMALL)
+                                        .text_color(theme.muted_foreground)
+                                        .child(branch.clone()),
+                                )
+                        };
+                        menu = menu.item(PopupMenuItem::element(row).on_click(move |_, window, cx| {
+                            let (path, root, name) = (path.clone(), root.clone(), name.clone());
+                            workspace
+                                .update(cx, |this, cx| this.compare_with_worktree(&path, &root, name, window, cx))
+                                .ok();
+                        }));
+                    }
+                    menu
+                })
+            },
+        )
+    }
+
+    /// When the tabs do not all fit: a button listing every one of them.
+    pub(super) fn render_tab_list(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::menu::DropdownMenu as _;
+        if self.tab_scroll.max_offset().x <= px(1.) {
+            return None;
+        }
+        let workspace = cx.entity().downgrade();
+        let items: Vec<(TabItem, SharedString, String, bool)> = self
+            .tab_order()
+            .into_iter()
+            .filter_map(|item| match item {
+                TabItem::Doc(ix) => {
+                    let doc = self.docs.get(ix)?;
+                    let folder = doc
+                        .path
+                        .parent()
+                        .map(|dir| super::relative_path(&self.root, dir))
+                        .unwrap_or_default();
+                    Some((item, doc.title.clone(), folder, !self.diff_active && self.active == Some(ix)))
+                }
+                TabItem::Diff => {
+                    let diff = self.diff.as_ref()?;
+                    Some((item, diff.title.clone(), "对比".to_string(), self.diff_active))
+                }
+            })
+            .collect();
+        let count = items.len();
+        Some(
+            div()
+                .flex_shrink_0()
+                .px_0p5()
+                .child(
+                    Button::new("tab-list")
+                        .ghost()
+                        .xsmall()
+                        .icon(icon("chevron-down"))
+                        .tooltip(format!("全部 {count} 个标签"))
+                        .dropdown_menu(move |menu, window, _| {
+                            let mut menu = Self::long_menu(menu, window).min_w(px(260.)).max_w(px(560.));
+                            for (item, title, folder, active) in &items {
+                                let workspace = workspace.clone();
+                                let item = *item;
+                                let (title, folder) = (title.clone(), folder.clone());
+                                // The name, and where it is, quieter.
+                                let row = move |_: &mut Window, cx: &mut App| {
+                                    let theme = cx.theme();
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .gap_2()
+                                        .child(crate::ui::file_icon(&title, cx).small())
+                                        .child(div().flex_shrink_0().child(title.clone()))
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(UI_SMALL)
+                                                .text_color(theme.muted_foreground)
+                                                .child(folder.clone()),
+                                        )
+                                };
+                                menu = menu.item(PopupMenuItem::element(row).checked(*active).on_click(
+                                    move |_, window, cx| {
+                                        workspace
+                                            .update(cx, |this, cx| match item {
+                                                TabItem::Doc(ix) => this.select_tab(ix, window, cx),
+                                                TabItem::Diff => this.show_diff(window, cx),
+                                            })
+                                            .ok();
+                                    },
+                                ));
+                            }
+                            menu
+                        }),
+                )
+                .into_any_element(),
+        )
     }
 
     pub(super) fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        // The tab just made active comes into view, however far the bar is scrolled.
+        let active_slot = self.tab_order().iter().position(|item| match item {
+            TabItem::Doc(ix) => !self.diff_active && self.active == Some(*ix),
+            TabItem::Diff => self.diff_active,
+        });
+        // A narrower bar may hide it again, so a change of width counts too.
+        let width = self.tab_scroll.bounds().size.width;
+        if active_slot != self.tab_in_view.get() || width != self.tab_bar_width.get() {
+            // Before the bar has been laid out once, a request to scroll is
+            // dropped: ask again on the next frame.
+            if width > px(0.) {
+                self.tab_in_view.set(active_slot);
+                self.tab_bar_width.set(width);
+                if let Some(slot) = active_slot {
+                    self.tab_scroll.scroll_to_item(slot);
+                }
+            } else {
+                cx.notify();
+            }
+        }
         let theme = cx.theme();
         let accent = theme.primary;
         let workspace = cx.entity().downgrade();
@@ -236,6 +373,7 @@ impl Workspace {
         let count = order.len();
         let split_path = self.split.as_ref().map(|split| split.path.clone());
         let others = self.other_worktrees();
+        let checkout = self.checkout_top();
 
         let tab = |id: ElementId, group: SharedString, active: bool| {
             h_flex()
@@ -308,6 +446,7 @@ impl Workspace {
             .w_full()
             .flex_shrink_0()
             .overflow_x_scroll()
+            .track_scroll(&self.tab_scroll)
             .children(order.iter().enumerate().map(|(slot, item)| {
                 let element = match *item {
                     TabItem::Doc(ix) => {
@@ -321,6 +460,21 @@ impl Workspace {
                         tab(("tab", ix).into(), group.clone(), active)
                             .child(file_icon(&doc.title, cx).small())
                             .child(doc.title.clone())
+                            // Files of the same name say which folder they are in.
+                            .when_some(
+                                (self.docs.iter().filter(|other| other.title == doc.title).count() > 1)
+                                    .then(|| doc.path.parent().and_then(|dir| dir.file_name()))
+                                    .flatten()
+                                    .map(|folder| folder.to_string_lossy().into_owned()),
+                                |tab, folder| {
+                                    tab.child(
+                                        div()
+                                            .text_size(UI_SMALL)
+                                            .text_color(theme.muted_foreground)
+                                            .child(folder),
+                                    )
+                                },
+                            )
                             .when(split_path.as_ref() == Some(&doc.path), |tab| {
                                 tab.child(icon("columns-2").xsmall().text_color(theme.muted_foreground))
                             })
@@ -350,7 +504,8 @@ impl Workspace {
                             }))
                             .context_menu({
                                 let others = others.clone();
-                                move |menu, _, _| Self::tab_menu(
+                                let checkout = checkout.clone();
+                                move |menu, window, cx| Self::tab_menu(
                                     menu,
                                     workspace.clone(),
                                     menu_path.clone(),
@@ -358,6 +513,9 @@ impl Workspace {
                                     slot + 1 < count,
                                     count > 1,
                                     others.clone(),
+                                    checkout.clone(),
+                                    window,
+                                    cx,
                                 )
                             })
                             .into_any_element()

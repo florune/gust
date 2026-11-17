@@ -236,6 +236,11 @@ pub struct Workspace {
     app: settings::AppSettings,
     /// The settings page, while it is open.
     settings_page: Option<FocusHandle>,
+    /// How far the tab bar is scrolled, for tabs that do not fit.
+    tab_scroll: ScrollHandle,
+    /// The tab last scrolled into view, so it is done once per change of tab.
+    tab_in_view: std::cell::Cell<Option<usize>>,
+    tab_bar_width: std::cell::Cell<Pixels>,
     /// The repository's worktrees, and the box that adds one.
     worktrees: worktrees_view::Worktrees,
     /// The shortcuts page, while it is open.
@@ -391,6 +396,9 @@ impl Workspace {
             settings_page: None,
             keymap_page: None,
             worktrees: Default::default(),
+            tab_scroll: ScrollHandle::new(),
+            tab_in_view: std::cell::Cell::new(None),
+            tab_bar_width: std::cell::Cell::new(px(0.)),
             lens_generation: 0,
             about: None,
             zoom_remainder: 0.,

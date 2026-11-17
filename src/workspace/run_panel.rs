@@ -625,6 +625,8 @@ impl Workspace {
             Button::new("run-configs")
                 .ghost()
                 .small()
+                .icon(icon("circle-plus"))
+                .text_color(theme.muted_foreground)
                 .label("添加运行配置…")
                 .on_click(cx.listener(|this, _, window, cx| this.open_run_configs(true, window, cx)))
                 .into_any_element()
@@ -634,7 +636,8 @@ impl Workspace {
                 .small()
                 .label(names[selected].clone())
                 .dropdown_caret(true)
-                .dropdown_menu(move |mut menu, _, _| {
+                .dropdown_menu(move |menu, window, _| {
+                    let mut menu = Self::long_menu(menu, window);
                     for (ix, name) in names.iter().enumerate() {
                         let choose = workspace.clone();
                         menu = menu.item(

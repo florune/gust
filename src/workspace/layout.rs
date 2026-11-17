@@ -31,6 +31,15 @@ pub(super) enum BottomTab {
 
 impl Workspace {
     /// Show the side panel's `tab`; asking for the one already shown hides the panel.
+    /// A menu that may hold many items: it scrolls, and stays inside the window.
+    pub(super) fn long_menu(
+        menu: gpui_kit::component::menu::PopupMenu,
+        window: &Window,
+    ) -> gpui_kit::component::menu::PopupMenu {
+        let room = (window.viewport_size().height - px(120.)).max(px(200.));
+        menu.scrollable(true).max_h(room)
+    }
+
     pub(super) fn toggle_sidebar_tab(&mut self, tab: SidebarTab, cx: &mut Context<Self>) {
         if self.sidebar_visible && self.sidebar_tab == tab {
             self.sidebar_visible = false;
@@ -50,11 +59,18 @@ impl Workspace {
         let theme = cx.theme();
         // Presses on the controls must not start dragging the window.
         let no_drag = |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation();
+        // The window's own buttons come after this row. Laid over the space
+        // beside them rather than sized by its contents, the row never pushes
+        // them out of the window: when it is narrow, its parts shrink and clip.
         TitleBar::new().child(
             h_flex()
-                .w_full()
-                .h_full()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
                 .gap_1()
+                .overflow_hidden()
                 .text_size(UI_TEXT)
                 .child(
                     div()
@@ -64,52 +80,65 @@ impl Workspace {
                 .child(
                     div()
                         .ml_1()
+                        .flex_shrink_0()
                         .on_mouse_down(MouseButton::Left, no_drag)
                         .child(project),
                 )
                 .children(worktree.map(|worktree| {
                     div()
+                        .min_w_0()
+                        .flex_shrink(1.)
+                        .overflow_hidden()
                         .on_mouse_down(MouseButton::Left, no_drag)
                         .child(worktree)
                 }))
                 .children(branch.map(|branch| {
                     div()
+                        .min_w_0()
+                        .flex_shrink(1.)
+                        .overflow_hidden()
                         .on_mouse_down(MouseButton::Left, no_drag)
                         .child(branch)
                 }))
-                .child(div().flex_1())
+                .child(div().flex_1().min_w_2())
                 .child(
                     h_flex()
                         .id("find-file")
+                        .flex_shrink(1.)
+                        .min_w(px(150.))
                         .w(px(380.))
+                        .overflow_hidden()
                         .h(px(26.))
                         .px_2()
                         .gap_2()
                         .rounded(theme.radius)
-                        .bg(theme.background)
+                        .bg(theme.background.opacity(0.6))
                         .border_1()
                         .border_color(theme.border)
                         .text_size(UI_SMALL)
                         .text_color(theme.muted_foreground)
-                        .hover(|this| this.border_color(theme.ring))
+                        .cursor_pointer()
+                        .hover(|this| this.border_color(theme.ring).text_color(theme.foreground))
                         .child(icon("search").xsmall())
-                        .child(format!("搜索 {}", self.project_name()))
+                        .child(div().min_w_0().truncate().child(format!("搜索 {}", self.project_name())))
                         .child(div().flex_1())
-                        .child(self.shortcut("find_file"))
+                        .child(crate::ui::key_chip(self.shortcut("find_file"), cx))
                         .on_mouse_down(MouseButton::Left, no_drag)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_palette(Mode::Files, window, cx)
                         })),
                 )
-                .child(div().flex_1())
+                .child(div().flex_1().min_w_2())
                 .child(
                     div()
                         .mr_2()
+                        .flex_shrink_0()
                         .on_mouse_down(MouseButton::Left, no_drag)
                         .child(self.render_run_toolbar(cx)),
                 )
-                // Room for the window buttons, so the search box sits mid-window.
-                .child(div().w(px(120.))),
+                // Room for the window buttons, so the search box sits mid-window;
+                // the first thing given up when space runs short.
+                .child(div().w(px(120.)).flex_shrink(20.).min_w_0()),
         )
     }
 
@@ -122,12 +151,19 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let current = self.root.to_string_lossy().into_owned();
         let recent = self.recent.clone();
+        let name = self.project_name();
         Button::new("project")
             .ghost()
             .small()
-            .label(self.project_name())
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(crate::ui::project_avatar(&name, px(18.)))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(name.clone())),
+            )
             .dropdown_caret(true)
-            .dropdown_menu(move |mut menu, _, _| {
+            .dropdown_menu(move |menu, window, _| {
+                let mut menu = Self::long_menu(menu, window);
                 let others: Vec<_> = recent
                     .iter()
                     .filter(|project| !project.path.eq_ignore_ascii_case(&current))
@@ -143,14 +179,21 @@ impl Workspace {
                     let shown = project.path.clone();
                     menu = menu.item(
                         PopupMenuItem::element(move |_, cx| {
-                            v_flex()
+                            h_flex()
                                 .py_0p5()
-                                .child(div().text_size(UI_TEXT).child(name.clone()))
+                                .gap_2()
+                                .child(crate::ui::project_avatar(&name, px(24.)))
                                 .child(
-                                    div()
-                                        .text_size(UI_SMALL)
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(shown.clone()),
+                                    v_flex()
+                                        .min_w_0()
+                                        .child(div().text_size(UI_TEXT).child(name.clone()))
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(UI_SMALL)
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(shown.clone()),
+                                        ),
                                 )
                         })
                         .on_click(move |_, window, cx| {
@@ -465,6 +508,7 @@ impl Workspace {
                 .border_b_1()
                 .border_color(cx.theme().border)
                 .child(div().flex_1().min_w_0().child(self.render_tabs(cx)))
+                .children(self.render_tab_list(cx))
                 .children(switch)
                 .children(split_button)
         });

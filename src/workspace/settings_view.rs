@@ -249,7 +249,7 @@ impl Workspace {
             .track_focus(focus)
             .occlude()
             .w(px(600.))
-            .max_h(px(640.))
+            .max_h(relative(0.85))
             .overflow_y_scroll()
             .p_4()
             .bg(theme.popover)

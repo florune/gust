@@ -15,7 +15,7 @@ use gpui_kit::*;
 
 use super::Workspace;
 use crate::git::{self, ChangeKind};
-use crate::ui::icon;
+use crate::ui::{UI_SMALL, icon};
 
 /// More changed files than this are not listed one by one.
 const MAX_LISTED: usize = 400;
@@ -329,6 +329,30 @@ impl Workspace {
     }
 
     /// The stashes, newest first, to pick one to bring back.
+    /// The local branches in the search box: typing narrows them, Enter switches.
+    pub(super) fn show_branches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.git.as_ref().map(|status| status.branch.clone()).unwrap_or_default();
+        let hits: Vec<crate::finder::Hit> = self
+            .branches
+            .iter()
+            .map(|branch| crate::finder::Hit {
+                path: branch.clone(),
+                row: 0,
+                col: 0,
+                preview: branch.clone(),
+                tag: if *branch == current { "当前" } else { "" },
+                detail: String::new(),
+            })
+            .collect();
+        self.open_palette(super::palette::Mode::Branches, window, cx);
+        if let Some(palette) = &mut self.palette {
+            palette.title = Some(format!("{} 个本地分支", hits.len()).into());
+            palette.found = hits.clone();
+            palette.hits = hits;
+        }
+        cx.notify();
+    }
+
     pub(super) fn show_stashes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.git.as_ref().map(|status| status.root.clone()) else {
             return;
@@ -401,7 +425,8 @@ impl Workspace {
                 .xsmall()
                 .icon(icon("git-branch"))
                 .label(label)
-                .dropdown_menu(move |mut menu, _, _| {
+                .dropdown_menu(move |menu, window, _| {
+                    let mut menu = Self::long_menu(menu, window);
                     let act = |label: &'static str, run: fn(&mut Self, &mut Window, &mut Context<Self>)| {
                         let workspace = workspace.clone();
                         PopupMenuItem::new(label).on_click(move |_, window, cx| {
@@ -409,6 +434,7 @@ impl Workspace {
                         })
                     };
                     menu = menu
+                        .item(act("查找分支…", |this, window, cx| this.show_branches(window, cx)))
                         .item(act("新建分支…", |this, window, cx| {
                             this.open_file_prompt(super::file_ops::FileAction::NewBranch, window, cx)
                         }))
@@ -416,13 +442,36 @@ impl Workspace {
                             this.open_file_prompt(super::file_ops::FileAction::Stash, window, cx)
                         }))
                         .item(act("恢复暂存…", |this, window, cx| this.show_stashes(window, cx)))
-                        .separator();
+                        .separator()
+                        .label("本地分支");
+                    // The current branch is marked here rather than checked: a
+                    // checked item scrolls the menu to it, past the actions above.
                     for branch in &branches {
                         let workspace = workspace.clone();
                         let name = branch.clone();
+                        let (shown, is_current) = (branch.clone(), *branch == current);
+                        let row = move |_: &mut Window, cx: &mut App| {
+                            let theme = cx.theme();
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(if is_current { theme.primary } else { theme.muted_foreground })
+                                        .child(icon(if is_current { "check" } else { "git-branch" }).xsmall()),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .when(is_current, |name| name.font_weight(FontWeight::SEMIBOLD))
+                                        .child(shown.clone()),
+                                )
+                        };
                         menu = menu.item(
-                            PopupMenuItem::new(branch.clone())
-                                .checked(*branch == current)
+                            PopupMenuItem::element(row)
                                 .on_click(move |_, window, cx| {
                                     workspace
                                         .update(cx, |workspace, cx| {
@@ -657,7 +706,7 @@ impl Workspace {
                         ),
                 )
             })
-            .child(
+            .when(!status.changes.is_empty(), |panel| panel.child(
                 h_flex()
                     .px_3()
                     .pt_3()
@@ -677,7 +726,7 @@ impl Workspace {
                                 })),
                         )
                     }),
-            )
+            ))
             .child(
                 v_flex()
                     .id("changes")
@@ -685,6 +734,19 @@ impl Workspace {
                     .min_h_0()
                     .overflow_y_scroll()
                     .children(rows)
+                    .when(status.changes.is_empty(), |list| {
+                        list.child(
+                            v_flex()
+                                .pt(px(48.))
+                                .gap_2()
+                                .items_center()
+                                .text_size(UI_SMALL)
+                                .text_color(theme.muted_foreground)
+                                .child(icon("circle-check").size(px(28.)).text_color(theme.muted_foreground.opacity(0.6)))
+                                .child("工作区是干净的")
+                                .child(div().text_xs().opacity(0.8).child(format!("{} 上没有未提交的改动", status.branch))),
+                        )
+                    })
                     .when(status.changes.len() > MAX_LISTED, |list| {
                         list.child(
                             div()

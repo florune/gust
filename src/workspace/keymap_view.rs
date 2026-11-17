@@ -298,6 +298,7 @@ impl Workspace {
             .occlude()
             .w(px(640.))
             .h(px(560.))
+            .max_h(relative(0.85))
             .p_4()
             .gap_2()
             .bg(theme.popover)

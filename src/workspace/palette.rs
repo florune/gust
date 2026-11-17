@@ -69,6 +69,8 @@ pub(super) enum Mode {
     Replace,
     /// Stashed changes, to bring one back.
     Stashes,
+    /// Local branches, to switch to one.
+    Branches,
     /// What can be done at the caret.
     Intentions,
     /// Interfaces of the project, to implement one.
@@ -124,6 +126,7 @@ impl Workspace {
                 Mode::History => "筛选",
                 Mode::Replace => "在所有文件中查找文字",
                 Mode::Stashes => "筛选",
+                Mode::Branches => "按名称筛选分支",
                 Mode::Intentions => "筛选",
                 Mode::Interfaces => "按名称筛选",
                 Mode::Actions => "输入操作名称",
@@ -182,6 +185,7 @@ impl Workspace {
                 | Mode::Problems
                 | Mode::History
                 | Mode::Stashes
+                | Mode::Branches
                 | Mode::Intentions
                 | Mode::Interfaces
                 | Mode::Actions
@@ -228,6 +232,7 @@ impl Workspace {
                     | Mode::Problems
                     | Mode::History
                     | Mode::Stashes
+                    | Mode::Branches
                     | Mode::Intentions
                     | Mode::Interfaces
                     | Mode::Actions => {
@@ -293,6 +298,13 @@ impl Workspace {
             let (file, name) = (std::path::PathBuf::from(&hit.path), hit.preview.clone());
             self.close_palette(window, cx);
             self.implement_interface(file, name, window, cx);
+            return;
+        }
+        // A branch is switched to.
+        if self.palette.as_ref().is_some_and(|palette| palette.mode == Mode::Branches) {
+            let branch = hit.path.clone();
+            self.close_palette(window, cx);
+            self.switch_branch(branch, window, cx);
             return;
         }
         // A stash is brought back.
@@ -489,6 +501,7 @@ impl Workspace {
                 Mode::Outline
                 | Mode::History
                 | Mode::Stashes
+                | Mode::Branches
                 | Mode::Intentions
                 | Mode::Interfaces
                 | Mode::Actions => {
@@ -505,6 +518,7 @@ impl Workspace {
                 .rounded(px(4.))
                 .when(ix == palette.selected, |row| row.bg(theme.list_active))
                 .hover(|row| row.bg(theme.list_hover))
+                .when_some(row_icon(palette.mode, name, cx), |row, icon| row.child(icon))
                 .when(!hit.tag.is_empty(), |row| {
                     row.child(
                         div()
@@ -522,7 +536,7 @@ impl Workspace {
                         .flex_shrink_0()
                         .max_w(px(420.))
                         .truncate()
-                        .when(!matches!(palette.mode, Mode::Files | Mode::Recent), |title| {
+                        .when(shows_code(palette.mode), |title| {
                             title.font_family(theme.mono_font_family.clone())
                         })
                         .child(title),
@@ -565,6 +579,7 @@ impl Workspace {
                             Mode::Text => "search",
                             Mode::Replace => "replace",
                             Mode::Stashes => "archive",
+                            Mode::Branches => "git-branch",
                             Mode::Intentions => "lightbulb",
                             Mode::Interfaces => "braces",
                             Mode::Actions => "command",
@@ -656,6 +671,26 @@ impl Workspace {
                 .into_any_element(),
         )
     }
+}
+
+/// Whether the rows of `mode` are code, written in the code font.
+fn shows_code(mode: Mode) -> bool {
+    matches!(
+        mode,
+        Mode::Text | Mode::Replace | Mode::Usages | Mode::Problems | Mode::Symbols | Mode::Outline | Mode::Interfaces
+    )
+}
+
+/// The icon a row starts with: its file's, for rows that are files or lines in them.
+fn row_icon(mode: Mode, name: &str, cx: &App) -> Option<AnyElement> {
+    let icon = match mode {
+        Mode::Files | Mode::Recent | Mode::Text | Mode::Replace | Mode::Usages | Mode::Problems => {
+            crate::ui::file_icon(name, cx)
+        }
+        Mode::Branches => icon("git-branch").text_color(cx.theme().muted_foreground),
+        _ => return None,
+    };
+    Some(div().flex_shrink_0().child(icon.small()).into_any_element())
 }
 
 /// Declarations named like `query` in the Go packages among `files`.

@@ -149,13 +149,22 @@ impl Workspace {
     }
 
     /// The other worktrees, by name, with their folders: what a file can be compared with.
-    pub(super) fn other_worktrees(&self) -> Vec<(String, PathBuf)> {
+    /// The other worktrees: name, branch, folder.
+    pub(super) fn other_worktrees(&self) -> Vec<(String, String, PathBuf)> {
         self.worktrees
             .list
             .iter()
             .filter(|worktree| !worktree.prunable && !self.is_current(worktree))
-            .map(|worktree| (worktree.name(), worktree.path.clone()))
+            .map(|worktree| {
+                let branch = worktree.branch.clone().unwrap_or_else(|| "游离 HEAD".to_string());
+                (worktree.name(), branch, worktree.path.clone())
+            })
             .collect()
+    }
+
+    /// The top of this window's checkout, for paths that mean the same in every worktree.
+    pub(super) fn checkout_top(&self) -> PathBuf {
+        self.checkout_root()
     }
 
     /// Compare the open file `path` with the same file in the worktree at `other_root`.
@@ -1102,7 +1111,8 @@ impl Workspace {
             .label(dialog.base.clone())
             .dropdown_caret(true)
             .disabled(existing)
-            .dropdown_menu(move |mut menu, _, _| {
+            .dropdown_menu(move |menu, window, _| {
+                let mut menu = Self::long_menu(menu, window);
                 for branch in &branches {
                     let workspace = workspace.clone();
                     let picked = branch.clone();
