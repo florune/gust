@@ -122,6 +122,33 @@ pub fn split_args(line: &str) -> Vec<String> {
     words
 }
 
+/// `env` with the variables of `overrides` in place of its own of the same
+/// names; both are `KEY=VALUE` lines.
+pub fn override_env(env: &str, overrides: &str) -> String {
+    let replaced = parse_env(overrides);
+    if replaced.is_empty() {
+        return env.to_string();
+    }
+    let mut lines: Vec<&str> = env
+        .lines()
+        .filter(|line| {
+            let key = line.split_once('=').map(|(key, _)| key.trim().trim_start_matches("export ").trim());
+            !key.is_some_and(|key| replaced.contains_key(key))
+        })
+        .collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let added: Vec<&str> = overrides
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && line.contains('='))
+        .collect();
+    lines.extend(added);
+    lines.join("
+")
+}
+
 /// `KEY=VALUE` lines; blank lines and `#` comments are skipped.
 pub fn parse_env(text: &str) -> HashMap<String, String> {
     text.lines()
@@ -406,6 +433,17 @@ mod tests {
             ["-name", "my app", "-dir", r"C:\some dir", "-q", r#"a "b""#]
         );
         assert_eq!(split_args(r#"-empty "" x"#), ["-empty", "", "x"]);
+    }
+
+    #[test]
+    fn overrides_replace_variables_of_the_same_name() {
+        assert_eq!(override_env("APP_ENV=dev
+PORT=8080", "PORT=8081"), "APP_ENV=dev
+PORT=8081");
+        assert_eq!(override_env("", "PORT=8081
+DEBUG=1"), "PORT=8081
+DEBUG=1");
+        assert_eq!(override_env("PORT=8080", ""), "PORT=8080");
     }
 
     #[test]

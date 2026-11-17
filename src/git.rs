@@ -53,7 +53,7 @@ pub struct Status {
     pub changes: Vec<Change>,
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let output = proc::command("git")
         // Paths are printed as they are, not octal-escaped.
         .args(["-c", "core.quotepath=false"])

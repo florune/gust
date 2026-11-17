@@ -49,6 +49,11 @@ pub(super) enum Source {
     Disk { file: PathBuf, mine: String },
     /// A version kept in local history against the file's current text.
     Version { file: PathBuf, version: PathBuf, current: String },
+    /// A worktree's files against the commit its branch grew from: all the
+    /// work done there, committed or not.
+    Worktree { dir: PathBuf, fork: String, base: String, name: String },
+    /// The same file in another worktree against this one's text.
+    Across { file: PathBuf, other: PathBuf, name: String, mine: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -149,7 +154,11 @@ impl DiffTab {
     pub fn working_path(&self) -> Option<String> {
         match self.source {
             Source::WorkingTree => self.entry().map(|entry| entry.path.clone()),
-            Source::Commit(_) | Source::Disk { .. } | Source::Version { .. } => None,
+            Source::Commit(_)
+            | Source::Disk { .. }
+            | Source::Version { .. }
+            | Source::Worktree { .. }
+            | Source::Across { .. } => None,
         }
     }
 }
@@ -186,6 +195,25 @@ fn read_versions(root: &Path, source: &Source, entry: &Entry) -> (Side, Side, St
                 .flatten();
             (side(old), side(new), "HEAD".into(), "工作区".into())
         }
+        Source::Worktree { dir, fork, base, name } => {
+            let old = (entry.status != 'A')
+                .then(|| history::file_at(dir, fork, old_path))
+                .flatten();
+            let new = (entry.status != 'D')
+                .then(|| std::fs::read(dir.join(&entry.path)).ok())
+                .flatten();
+            (side(old), side(new), format!("{base} · 分叉点 {}", &fork[..fork.len().min(8)]), format!("工作树 {name}"))
+        }
+        Source::Across { other, name, mine, .. } => (
+            if other.is_file() {
+                side(std::fs::read(other).ok())
+            } else {
+                Err(format!("工作树 {name} 中没有这个文件").into())
+            },
+            Ok(mine.clone()),
+            format!("工作树 {name}"),
+            "当前".into(),
+        ),
         Source::Version { version, current, .. } => (
             crate::local_history::load(version).ok_or_else(|| "无法读取该版本".into()),
             Ok(current.clone()),
@@ -330,6 +358,7 @@ impl Workspace {
             Source::WorkingTree => String::new(),
             Source::Disk { .. } => "冲突 · ".to_string(),
             Source::Version { .. } => "本地历史 · ".to_string(),
+            Source::Worktree { name, .. } | Source::Across { name, .. } => format!("{name} · "),
         };
         tab.title = format!("{short}{}", entry.name()).into();
         let source = tab.source.clone();
@@ -691,7 +720,14 @@ impl Workspace {
         let (added, removed) = tab.counts();
         let entry = tab.entry().cloned();
         let open_path = match &tab.source {
-            Source::Disk { file, .. } | Source::Version { file, .. } => Some(file.clone()),
+            Source::Disk { file, .. } | Source::Version { file, .. } | Source::Across { file, .. } => {
+                Some(file.clone())
+            }
+            Source::Worktree { dir, .. } => entry
+                .as_ref()
+                .filter(|entry| entry.status != 'D')
+                .map(|entry| dir.join(&entry.path))
+                .filter(|path| path.is_file()),
             _ => entry
                 .as_ref()
                 .filter(|entry| entry.status != 'D')
@@ -712,6 +748,12 @@ impl Workspace {
                 format!("{} · 磁盘版本与未保存的修改", entry.path)
             }
             (Source::Version { .. }, Some(entry)) => format!("{} · 本地历史版本与当前内容", entry.path),
+            (Source::Across { name, .. }, Some(entry)) => {
+                format!("{} · 工作树 {name} 中的版本与当前内容，点击中间的箭头可取用左侧的内容", entry.path)
+            }
+            (Source::Worktree { name, base, .. }, Some(entry)) => {
+                format!("{} · 工作树 {name} 相对 {base} 的全部改动，点击中间的箭头可撤销该处改动", entry.path)
+            }
             (_, None) => "没有改动".to_string(),
         };
         let header_button = |id: &'static str, glyph: &'static str, tip: &'static str| {
@@ -748,6 +790,24 @@ impl Workspace {
                 header_button("change-next", "arrow-down", "下一处改动 (F7)").on_click(
                     cx.listener(|this, _, window, cx| this.step_change(true, window, cx)),
                 ),
+            )
+            .when_some(
+                match &tab.source {
+                    Source::Worktree { dir, base, .. } => Some((dir.clone(), base.clone())),
+                    _ => None,
+                },
+                |row, (dir, base)| {
+                    use gpui_kit::component::button::{Button, ButtonVariants as _};
+                    row.child(
+                        Button::new("worktree-merge")
+                            .xsmall()
+                            .primary()
+                            .label(format!("合并到 {base}…"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_merge_worktree(dir.clone(), window, cx)
+                            })),
+                    )
+                },
             )
             .when_some(
                 match &tab.source {
@@ -818,7 +878,7 @@ impl Workspace {
                 .child(view.note.clone().unwrap())
                 .into_any_element(),
             Some(view) => {
-                let mergeable = matches!(tab.source, Source::Disk { .. });
+                let mergeable = matches!(tab.source, Source::Disk { .. } | Source::Worktree { .. } | Source::Across { .. });
                 self.render_sides(view, mergeable, cx)
             }
         };
@@ -1023,7 +1083,11 @@ impl Workspace {
             (top - px(2.)..bottom + px(2.)).contains(&y)
         });
         if let Some(ix) = found {
-            self.take_disk_chunk(ix, window, cx);
+            if matches!(self.diff.as_ref().map(|tab| &tab.source), Some(Source::Worktree { .. })) {
+                self.revert_worktree_chunk(ix, cx);
+            } else {
+                self.take_disk_chunk(ix, window, cx);
+            }
         }
     }
 
@@ -1032,7 +1096,7 @@ impl Workspace {
         let Some(tab) = &self.diff else {
             return;
         };
-        let Source::Disk { file, .. } = &tab.source else {
+        let (Source::Disk { file, .. } | Source::Across { file, .. }) = &tab.source else {
             return;
         };
         let Some(view) = &tab.view else {
@@ -1057,5 +1121,41 @@ impl Workspace {
         let merged = crate::compare::take_lines(&disk, &mine, &chunk);
         super::replace_text(&editor, &mine, &merged, window, cx);
         self.refresh_dirty(&editor, cx);
+    }
+
+    /// In a worktree review, put change `ix` back as it was at the fork point,
+    /// in the worktree's file on disk.
+    pub(super) fn revert_worktree_chunk(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(tab) = &self.diff else {
+            return;
+        };
+        let (Source::Worktree { dir, .. }, Some(view), Some(entry)) = (&tab.source, &tab.view, tab.entry()) else {
+            return;
+        };
+        let Some(chunk) = view.comparison.chunks.get(ix).cloned() else {
+            return;
+        };
+        let path = dir.join(&entry.path);
+        let old = view.left.read(cx).text().to_string();
+        let new = view.right.read(cx).text().to_string();
+        // The file changed since it was read: show it again first.
+        let on_disk = std::fs::read(&path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default();
+        let crlf = on_disk.contains("\r\n");
+        if on_disk.replace("\r\n", "\n") != new {
+            self.load_compare(true, cx);
+            return;
+        }
+        let reverted = crate::compare::take_lines(&old, &new, &chunk);
+        let text = if crlf { reverted.replace('\n', "\r\n") } else { reverted };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, text) {
+            Ok(()) => self.load_compare(true, cx),
+            Err(err) => {
+                self.notice = Some(format!("无法撤销：{err}").into());
+                cx.notify();
+            }
+        }
     }
 }

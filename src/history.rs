@@ -254,7 +254,7 @@ pub fn details(root: &Path, commit: &Commit) -> Result<Details, String> {
 }
 
 /// Parse `--name-status -z`: a status, then one path, or two for a rename or copy.
-fn parse_name_status(output: &str) -> Vec<ChangedFile> {
+pub(crate) fn parse_name_status(output: &str) -> Vec<ChangedFile> {
     let mut fields = output.split('\0').filter(|field| !field.is_empty());
     let mut files = Vec::new();
     while let Some(status) = fields.next() {

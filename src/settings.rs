@@ -25,6 +25,10 @@ pub struct AppSettings {
     pub code_lens: bool,
     /// Brackets in color by depth, and the pair at the caret marked.
     pub bracket_colors: bool,
+    /// Names of local files a new worktree gets a copy of; `*` matches anything.
+    pub worktree_files: Vec<String>,
+    /// A new worktree opens in a window of its own.
+    pub worktree_new_window: bool,
     /// Shortcuts the user chose, by command; commands not listed keep their defaults.
     pub keymap: std::collections::BTreeMap<String, Vec<String>>,
 }
@@ -41,6 +45,8 @@ impl Default for AppSettings {
             hover_docs: true,
             code_lens: true,
             bracket_colors: true,
+            worktree_files: [".env", ".env.*", "*.local", "*.local.*"].map(String::from).to_vec(),
+            worktree_new_window: true,
             keymap: Default::default(),
         }
     }
@@ -63,6 +69,43 @@ pub fn load_app() -> AppSettings {
 pub fn save_app(settings: &AppSettings) -> Result<(), String> {
     let text = serde_json::to_string_pretty(settings).expect("settings serialize");
     write(&app_file(), &text).map_err(|err| format!("无法保存设置：{err}"))
+}
+
+/// The marker colors chosen for worktrees, by folder. Kept apart from each
+/// project's settings, which every open window writes back as it holds them.
+fn worktree_colors_file() -> PathBuf {
+    config_dir().join("worktree-colors.json")
+}
+
+/// A folder spelled one way, whatever the case or slashes it was given in.
+fn folder_key(path: &Path) -> String {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.trim_start_matches("//?/").trim_end_matches('/').to_string();
+    if cfg!(windows) { text.to_lowercase() } else { text }
+}
+
+pub fn worktree_colors() -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(worktree_colors_file())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// The marker color of the worktree at `path`, by name; empty is the default.
+pub fn worktree_color(colors: &std::collections::HashMap<String, String>, path: &Path) -> String {
+    colors.get(&folder_key(path)).cloned().unwrap_or_default()
+}
+
+pub fn set_worktree_color(path: &Path, color: &str) -> Result<(), String> {
+    let mut colors = worktree_colors();
+    if color.is_empty() {
+        colors.remove(&folder_key(path));
+    } else {
+        colors.insert(folder_key(path), color.to_string());
+    }
+    let text = serde_json::to_string_pretty(&colors).expect("colors serialize");
+    write(&worktree_colors_file(), &text).map_err(|err| format!("无法保存：{err}"))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

@@ -56,6 +56,7 @@ mod tabs;
 mod test_runner;
 mod usages;
 mod windows;
+mod worktrees_view;
 
 pub use windows::open_window;
 
@@ -129,6 +130,7 @@ pub fn init(cx: &mut App) {
     action_search::init(cx);
     merge_view::init(cx);
     windows::init(cx);
+    worktrees_view::init(cx);
     run_panel::init(cx);
 }
 
@@ -234,6 +236,8 @@ pub struct Workspace {
     app: settings::AppSettings,
     /// The settings page, while it is open.
     settings_page: Option<FocusHandle>,
+    /// The repository's worktrees, and the box that adds one.
+    worktrees: worktrees_view::Worktrees,
     /// The shortcuts page, while it is open.
     keymap_page: Option<keymap_view::KeymapPage>,
     /// Bumped when a save or a change on disk may change usage counts.
@@ -263,6 +267,9 @@ pub struct Workspace {
     memory_mb: u64,
     /// Why the last save or format did not go through, shown in the status bar.
     notice: Option<SharedString>,
+    /// What just went through, shown in the status bar for a moment.
+    info: Option<SharedString>,
+    info_clear: Task<()>,
     index: Arc<Index>,
     settings: ProjectSettings,
     /// Projects opened before, for the project menu.
@@ -383,6 +390,7 @@ impl Workspace {
             app: settings::load_app(),
             settings_page: None,
             keymap_page: None,
+            worktrees: Default::default(),
             lens_generation: 0,
             about: None,
             zoom_remainder: 0.,
@@ -399,6 +407,8 @@ impl Workspace {
             terminals_opened: 0,
             memory_mb: 0,
             notice: None,
+            info: None,
+            info_clear: Task::ready(()),
             index: Arc::new(Index::new()),
             markdown_view: DocView::Preview,
 
@@ -1006,9 +1016,30 @@ impl Workspace {
         }
     }
 
+    /// Say in the status bar that something went through; it goes away by itself.
+    pub(super) fn inform(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.info = Some(text.into());
+        self.info_clear = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(6)).await;
+            this.update(cx, |this, cx| {
+                this.info = None;
+                cx.notify();
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let root = self.root.clone();
-        let view = cx.new(|cx| TerminalView::new(root, cx));
+        self.new_terminal_in(self.root.clone(), window, cx);
+    }
+
+    /// A terminal whose shell starts in `dir`.
+    pub(super) fn new_terminal_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let elsewhere = (dir != self.root).then(|| {
+            dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+        });
+        let view = cx.new(|cx| TerminalView::new(dir, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -1025,7 +1056,10 @@ impl Workspace {
         );
         self.terminals_opened += 1;
         self.terminals.push(TerminalTab {
-            name: format!("终端 {}", self.terminals_opened).into(),
+            name: match elsewhere {
+                Some(folder) => format!("终端 {} · {folder}", self.terminals_opened).into(),
+                None => format!("终端 {}", self.terminals_opened).into(),
+            },
             view,
             _subscription: subscription,
         });

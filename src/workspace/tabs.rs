@@ -169,6 +169,7 @@ impl Workspace {
         relative: String,
         has_right: bool,
         has_others: bool,
+        worktrees: Vec<(String, PathBuf)>,
     ) -> PopupMenu {
         let act = |label: &'static str,
                    enabled: bool,
@@ -210,6 +211,21 @@ impl Workspace {
         .item(act("本地历史…", true, |this, path, window, cx| {
             this.show_local_history(path.to_path_buf(), window, cx)
         }))
+        .when(!worktrees.is_empty(), |menu| {
+            let mut menu = menu.separator();
+            for (name, root) in worktrees {
+                let workspace = workspace.clone();
+                let path = path.clone();
+                let label = format!("与工作树 {name} 中的版本比较");
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let (path, root, name) = (path.clone(), root.clone(), name.clone());
+                    workspace
+                        .update(cx, |this, cx| this.compare_with_worktree(&path, &root, name, window, cx))
+                        .ok();
+                }));
+            }
+            menu
+        })
     }
 
     pub(super) fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -219,6 +235,7 @@ impl Workspace {
         let order = self.tab_order();
         let count = order.len();
         let split_path = self.split.as_ref().map(|split| split.path.clone());
+        let others = self.other_worktrees();
 
         let tab = |id: ElementId, group: SharedString, active: bool| {
             h_flex()
@@ -331,14 +348,16 @@ impl Workspace {
                             .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
                                 this.move_tab(dragged.slot, slot, cx)
                             }))
-                            .context_menu(move |menu, _, _| {
-                                Self::tab_menu(
+                            .context_menu({
+                                let others = others.clone();
+                                move |menu, _, _| Self::tab_menu(
                                     menu,
                                     workspace.clone(),
                                     menu_path.clone(),
                                     relative.clone(),
                                     slot + 1 < count,
                                     count > 1,
+                                    others.clone(),
                                 )
                             })
                             .into_any_element()

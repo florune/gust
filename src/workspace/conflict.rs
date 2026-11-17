@@ -82,7 +82,7 @@ impl Workspace {
         let Some(tab) = &mut self.diff else {
             return;
         };
-        if let Source::Disk { file, mine: shown } = &mut tab.source
+        if let Source::Disk { file, mine: shown } | Source::Across { file, mine: shown, .. } = &mut tab.source
             && file == path
         {
             *shown = mine;

@@ -24,6 +24,7 @@ const MAX_LISTED: usize = 400;
 pub(super) enum SidebarTab {
     Files,
     Changes,
+    Worktrees,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,13 +73,23 @@ impl Workspace {
                 .as_ref()
                 .map(|status| git::branches(&status.root))
                 .unwrap_or_default();
-            (status, branches)
+            let worktrees = status
+                .as_ref()
+                .map(|status| crate::worktree::list(&status.root))
+                .unwrap_or_default();
+            let colors = if worktrees.len() > 1 { crate::settings::worktree_colors() } else { Default::default() };
+            (status, branches, worktrees, colors)
         });
         // Replacing the task drops an older refresh that has not finished.
         self.git_refresh = cx.spawn(async move |this, cx| {
-            let (status, branches) = loading.await;
+            let (status, branches, worktrees, colors) = loading.await;
             this.update(cx, |this, cx| {
                 this.branches = branches;
+                this.worktrees.colors = colors;
+                if this.worktrees.list != worktrees {
+                    this.worktrees.list = worktrees;
+                    cx.notify();
+                }
                 if this.git != status {
                     this.apply_git_status(status, cx);
                 }

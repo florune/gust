@@ -2080,7 +2080,7 @@ fn ctrl_shift_r_replaces_text_in_every_file(cx: &mut TestAppContext) {
     assert_eq!(fixture.text(cx), "new one\n");
     assert_eq!(std::fs::read_to_string(fixture.root.join("docs/b.md")).unwrap(), "new two new\n");
     assert_eq!(std::fs::read_to_string(fixture.root.join("c.md")).unwrap(), "nothing\n");
-    let notice = fixture.workspace.read_with(cx, |workspace, _| workspace.notice.clone());
+    let notice = fixture.workspace.read_with(cx, |workspace, _| workspace.info.clone());
     assert_eq!(notice.as_deref(), Some("已替换 3 处，2 个文件"));
 }
 
@@ -2490,4 +2490,146 @@ fn brackets_follow_edits_and_pair_up_at_the_caret(cx: &mut TestAppContext) {
     fixture.input("s := \"(\"; ", cx);
     assert_eq!(scan(cx).all.len(), 8);
     assert!(scan(cx).all.iter().all(|bracket| bracket.depth.is_some()));
+}
+
+#[gpui_kit::test]
+fn a_worktree_is_made_listed_and_removed_from_its_panel(cx: &mut TestAppContext) {
+    let fixture = Fixture::in_repository(cx, "worktrees", &[("main.go", "package main\n"), (".gitignore", ".env\n")], "main.go");
+    std::fs::write(fixture.root.join(".env"), "PORT=8080\n").unwrap();
+    fixture.settle(cx);
+    let count = |cx: &mut TestAppContext| fixture.workspace.read_with(cx, |workspace, _| workspace.worktrees.list.len());
+    assert_eq!(count(cx), 1);
+
+    fixture.update(cx, |workspace, window, cx| workspace.open_new_worktree(window, cx));
+    fixture.input("feature/x", cx);
+    let place = fixture.workspace.read_with(cx, |workspace, cx| {
+        let dialog = workspace.worktrees.dialog.as_ref().expect("the box is open");
+        PathBuf::from(dialog.location.read(cx).value().to_string())
+    });
+    // Beside the repository, in a folder named after it, however the temp folder is spelled.
+    let beside = fixture.root.parent().unwrap().join(format!("{}.worktrees", fixture.root.file_name().unwrap().to_string_lossy()));
+    assert_eq!(place.file_name().unwrap(), "feature-x");
+    assert_eq!(place.parent().unwrap().file_name(), beside.file_name());
+    assert!(crate::worktree::same_path(place.parent().unwrap().parent().unwrap(), fixture.root.parent().unwrap()));
+    fixture.update(cx, |workspace, window, cx| {
+        workspace.worktrees.dialog.as_mut().unwrap().new_window = false;
+        workspace.create_worktree(window, cx);
+    });
+    fixture.settle(cx);
+    fixture.update(cx, |workspace, _, cx| workspace.refresh_git(cx));
+    fixture.settle(cx);
+    assert_eq!(count(cx), 2);
+    assert!(fixture.workspace.read_with(cx, |workspace, _| workspace.worktrees.dialog.is_none()));
+    assert_eq!(std::fs::read_to_string(place.join(".env")).unwrap(), "PORT=8080\n");
+
+    // Removing it asks first, then takes the folder away.
+    fixture.update(cx, |workspace, window, cx| workspace.ask_remove_worktree(place.clone(), window, cx));
+    fixture.press("enter", cx);
+    fixture.settle(cx);
+    assert!(!place.exists());
+    fixture.update(cx, |workspace, _, cx| workspace.refresh_git(cx));
+    fixture.settle(cx);
+    assert_eq!(count(cx), 1);
+    let _ = std::fs::remove_dir_all(&beside);
+}
+
+#[gpui_kit::test]
+fn a_worktree_is_reviewed_reverted_merged_and_cleaned_up(cx: &mut TestAppContext) {
+    let fixture = Fixture::in_repository(cx, "worktree-merge", &[("a.txt", "one\ntwo\nthree\n")], "a.txt");
+    let place = fixture.root.parent().unwrap().join(format!("{}.worktrees", fixture.root.file_name().unwrap().to_string_lossy())).join("work");
+    git(&fixture.root, &["worktree", "add", "--quiet", "-b", "work", &place.to_string_lossy(), "main"]);
+    std::fs::write(place.join("a.txt"), "ONE\ntwo\nTHREE\n").unwrap();
+    git(&place, &["commit", "--quiet", "-am", "shout"]);
+    std::fs::write(place.join("b.txt"), "new\n").unwrap();
+    fixture.update(cx, |workspace, _, cx| workspace.refresh_git(cx));
+    fixture.settle(cx);
+
+    // The review lists committed and uncommitted work alike.
+    fixture.update(cx, |workspace, window, cx| workspace.review_worktree(place.clone(), window, cx));
+    fixture.settle(cx);
+    let listed = fixture.workspace.read_with(cx, |workspace, _| {
+        let tab = workspace.diff.as_ref().expect("the review is open");
+        tab.entries.iter().map(|entry| (entry.path.clone(), entry.status)).collect::<Vec<_>>()
+    });
+    assert_eq!(listed, [("a.txt".to_string(), 'M'), ("b.txt".to_string(), 'A')]);
+
+    // Taking back the last change leaves the first.
+    fixture.update(cx, |workspace, _, cx| workspace.revert_worktree_chunk(1, cx));
+    fixture.settle(cx);
+    assert_eq!(std::fs::read_to_string(place.join("a.txt")).unwrap(), "ONE\ntwo\nthree\n");
+
+    // Merging commits what was left uncommitted, then squashes it all onto main.
+    fixture.update(cx, |workspace, window, cx| workspace.open_merge_worktree(place.clone(), window, cx));
+    let (strategy, commit_first) = fixture.workspace.read_with(cx, |workspace, _| {
+        let dialog = workspace.worktrees.merging.as_ref().expect("the merge box is open");
+        (dialog.strategy, dialog.commit_first)
+    });
+    assert_eq!(strategy, crate::worktree::Strategy::Squash);
+    assert!(commit_first);
+    fixture.update(cx, |workspace, window, cx| workspace.merge_worktree(window, cx));
+    fixture.settle(cx);
+    assert_eq!(std::fs::read_to_string(fixture.root.join("a.txt")).unwrap(), "ONE\ntwo\nthree\n");
+    assert_eq!(std::fs::read_to_string(fixture.root.join("b.txt")).unwrap(), "new\n");
+    assert_eq!(git(&fixture.root, &["log", "-1", "--format=%s"]).trim(), "shout");
+    assert!(fixture.workspace.read_with(cx, |workspace, _| workspace.diff.is_none()), "the review closes");
+
+    // Then it offers to take the worktree and its branch away.
+    fixture.press("enter", cx);
+    fixture.settle(cx);
+    assert!(!place.exists());
+    assert!(!git(&fixture.root, &["branch"]).contains("work"));
+    let _ = std::fs::remove_dir_all(place.parent().unwrap());
+}
+
+#[gpui_kit::test]
+fn files_compare_across_worktrees_and_new_ones_get_their_own_settings(cx: &mut TestAppContext) {
+    let fixture = Fixture::in_repository(cx, "worktree-across", &[("a.txt", "one\ntwo\n")], "a.txt");
+    let beside = fixture.root.parent().unwrap().join(format!("{}.worktrees", fixture.root.file_name().unwrap().to_string_lossy()));
+    let other = beside.join("other");
+    git(&fixture.root, &["worktree", "add", "--quiet", "-b", "other", &other.to_string_lossy(), "main"]);
+    std::fs::write(other.join("a.txt"), "one\nTWO\n").unwrap();
+    fixture.update(cx, |workspace, _, cx| workspace.refresh_git(cx));
+    fixture.settle(cx);
+
+    // The open file against its copy in the other worktree; a click takes its lines.
+    let names: Vec<String> = fixture.workspace.read_with(cx, |workspace, _| {
+        workspace.other_worktrees().into_iter().map(|(name, _)| name).collect()
+    });
+    assert_eq!(names, ["other"]);
+    let file = fixture.root.join("a.txt");
+    fixture.update(cx, |workspace, window, cx| {
+        workspace.compare_with_worktree(&file, &other, "other".to_string(), window, cx)
+    });
+    fixture.settle(cx);
+    fixture.update(cx, |workspace, window, cx| workspace.take_disk_chunk(0, window, cx));
+    assert_eq!(fixture.text(cx), "one\nTWO\n");
+
+    // A new worktree's run configurations take the variables given for it.
+    fixture.update(cx, |workspace, _, _| {
+        workspace.settings.runs = vec![crate::run::RunConfig { env: "PORT=8080\nAPP=dev".into(), ..Default::default() }];
+        crate::settings::save(&workspace.root, &workspace.settings).unwrap();
+    });
+    fixture.update(cx, |workspace, window, cx| workspace.open_new_worktree(window, cx));
+    fixture.input("second", cx);
+    let second = fixture.workspace.read_with(cx, |workspace, cx| {
+        PathBuf::from(workspace.worktrees.dialog.as_ref().unwrap().location.read(cx).value().to_string())
+    });
+    fixture.update(cx, |workspace, window, cx| {
+        let dialog = workspace.worktrees.dialog.as_mut().unwrap();
+        dialog.new_window = false;
+        dialog.env.update(cx, |input, cx| input.set_value("PORT=8081", window, cx));
+        workspace.create_worktree(window, cx);
+    });
+    fixture.settle(cx);
+    let runs = crate::settings::load(&second).runs;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].env, "APP=dev\nPORT=8081");
+
+    // Its marker takes the color chosen for it.
+    fixture.update(cx, |workspace, _, cx| workspace.set_worktree_color(other.clone(), "green", cx));
+    let (marker, green) = fixture.workspace.read_with(cx, |workspace, cx| {
+        (workspace.worktree_color(&other, cx), crate::theme::palette(cx).green)
+    });
+    assert_eq!(marker, green);
+    let _ = std::fs::remove_dir_all(&beside);
 }

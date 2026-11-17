@@ -38,6 +38,7 @@ impl Workspace {
             self.sidebar_visible = true;
             self.sidebar_tab = tab;
         }
+        self.watch_worktrees(cx);
         cx.notify();
     }
 
@@ -45,6 +46,7 @@ impl Workspace {
         let branch = self.render_branch(cx);
         let project = self.render_project_menu(cx);
         let app_menu = self.render_app_menu(cx);
+        let worktree = self.render_worktree_marker(cx);
         let theme = cx.theme();
         // Presses on the controls must not start dragging the window.
         let no_drag = |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation();
@@ -65,6 +67,11 @@ impl Workspace {
                         .on_mouse_down(MouseButton::Left, no_drag)
                         .child(project),
                 )
+                .children(worktree.map(|worktree| {
+                    div()
+                        .on_mouse_down(MouseButton::Left, no_drag)
+                        .child(worktree)
+                }))
                 .children(branch.map(|branch| {
                     div()
                         .on_mouse_down(MouseButton::Left, no_drag)
@@ -192,6 +199,7 @@ impl Workspace {
                 .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         };
         let files = self.sidebar_visible && self.sidebar_tab == SidebarTab::Files;
+        let worktrees = self.sidebar_visible && self.sidebar_tab == SidebarTab::Worktrees;
         let commit = self.sidebar_visible && self.sidebar_tab == SidebarTab::Changes;
         v_flex()
             .w(px(ACTIVITY_WIDTH))
@@ -235,6 +243,10 @@ impl Workspace {
                         this.toggle_sidebar_tab(SidebarTab::Changes, cx)
                     })),
             )
+            .child(
+                button("activity-worktrees", "git-fork", self.tip("工作树", "worktrees"), worktrees)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar_tab(SidebarTab::Worktrees, cx))),
+            )
             .child(div().flex_1())
             .child(
                 button(
@@ -273,7 +285,7 @@ impl Workspace {
 
     /// A small icon button for panel headers.
     pub(super) fn header_button(
-        id: &'static str,
+        id: impl Into<ElementId>,
         name: &'static str,
         tip: &'static str,
         cx: &App,
@@ -296,11 +308,13 @@ impl Workspace {
         let content = match self.sidebar_tab {
             SidebarTab::Files => self.tree.clone().into_any_element(),
             SidebarTab::Changes => self.render_changes(cx),
+            SidebarTab::Worktrees => self.render_worktrees(cx),
         };
         let theme = cx.theme();
         let title = match self.sidebar_tab {
             SidebarTab::Files => "项目",
             SidebarTab::Changes => "提交",
+            SidebarTab::Worktrees => "工作树",
         };
         let actions = match self.sidebar_tab {
             SidebarTab::Files => h_flex()
@@ -352,6 +366,10 @@ impl Workspace {
             SidebarTab::Changes => h_flex().gap_0p5().child(
                 Self::header_button("changes-refresh", "refresh-cw", "刷新", cx)
                     .on_click(cx.listener(|this, _, _, cx| this.refresh_git(cx))),
+            ),
+            SidebarTab::Worktrees => h_flex().gap_0p5().child(
+                Self::header_button("worktree-new", "plus", "新建工作树", cx)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_new_worktree(window, cx))),
             ),
         };
         v_flex()
@@ -648,6 +666,17 @@ impl Workspace {
             .bg(theme.status_bar)
             .border_t_1()
             .border_color(theme.status_bar_border)
+            .when_some(self.info.clone(), |this, info| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .px_1p5()
+                        .min_w_0()
+                        .text_color(theme.success)
+                        .child(icon("circle-check").xsmall())
+                        .child(div().truncate().child(info)),
+                )
+            })
             .when_some(self.notice.clone(), |this, notice| {
                 this.child(
                     h_flex()
@@ -741,6 +770,8 @@ impl Render for Workspace {
         let settings_page = self.render_settings_page(cx);
         let keymap_page = self.render_keymap_page(cx);
         let about = self.render_about(cx);
+        let new_worktree = self.render_new_worktree(cx);
+        let merge_worktree = self.render_merge_worktree(cx);
         let merge_dialog = self.render_merge_dialog(cx);
         let zoom = self.render_zoom_listener(cx);
         let autoscroll = self.render_autoscroll(cx);
@@ -781,6 +812,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_open_keymap))
             .on_action(cx.listener(Self::on_show_about))
+            .on_action(cx.listener(Self::on_show_worktrees))
+            .on_action(cx.listener(Self::on_new_worktree))
             .on_action(cx.listener(Self::on_show_intentions))
             .on_action(cx.listener(Self::on_tab_or_template))
             .on_action(cx.listener(Self::on_find_action))
@@ -878,6 +911,8 @@ impl Render for Workspace {
             .children(settings_page)
             .children(keymap_page)
             .children(about)
+            .children(new_worktree)
+            .children(merge_worktree)
             .children(merge_dialog)
             .child(zoom)
             .children(file_prompt)

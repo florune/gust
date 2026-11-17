@@ -79,6 +79,7 @@ pub(super) fn all() -> Vec<Command> {
     use super::split::{CloseSplit, SplitRight};
     use super::test_runner::RunTestAtCaret;
     use super::usages::FindUsages;
+    use super::worktrees_view::{NewWorktree, ShowWorktrees};
     use super::*;
     use gpui_kit::component::input::{GoToDefinition, ShowCompletions};
     const W: &str = WORKSPACE;
@@ -127,6 +128,8 @@ pub(super) fn all() -> Vec<Command> {
         command!("new_branch", "新建分支", [], NewBranch),
         command!("stash", "暂存改动 (stash)", [], StashChanges),
         command!("unstash", "恢复暂存", [], UnstashChanges),
+        command!("worktrees", "工作树", [], ShowWorktrees),
+        command!("new_worktree", "新建工作树", [], NewWorktree),
         command!("terminal", "终端", [("alt-f12", W), ("ctrl-`", W)], ToggleTerminal),
         command!("new_terminal", "新建终端", [("ctrl-shift-`", W)], NewTerminal),
         command!("sidebar", "项目面板", [("alt-1", W)], ToggleSidebar),

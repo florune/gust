@@ -22,6 +22,7 @@ mod run;
 mod schemes;
 mod settings;
 mod terminal;
+mod worktree;
 mod theme;
 mod ui;
 mod workspace;

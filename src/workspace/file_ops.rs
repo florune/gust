@@ -36,6 +36,10 @@ pub(super) enum FileAction {
     NewBranch,
     /// Put the uncommitted changes aside, with a message.
     Stash,
+    /// Take a worktree of the repository away.
+    RemoveWorktree(PathBuf),
+    /// After a merge: take the worktree and its branch away.
+    CleanupWorktree(PathBuf, String),
 }
 
 pub(super) struct FilePrompt {
@@ -130,7 +134,7 @@ impl Workspace {
             }
         });
         let focus = cx.focus_handle();
-        if matches!(action, FileAction::Delete(_) | FileAction::Rollback(_)) {
+        if matches!(action, FileAction::Delete(_) | FileAction::Rollback(_) | FileAction::RemoveWorktree(_) | FileAction::CleanupWorktree(..)) {
             focus.focus(window, cx);
         } else {
             input.update(cx, |input, cx| input.focus(window, cx));
@@ -179,6 +183,8 @@ impl Workspace {
             FileAction::New { dir, folder } => self.create(&dir, &typed, folder, window, cx),
             FileAction::Rename(path) => self.rename(&path, &typed, cx),
             FileAction::Delete(path) => self.delete(&path, window, cx),
+            FileAction::RemoveWorktree(path) => self.remove_worktree(&path, cx),
+            FileAction::CleanupWorktree(path, branch) => self.clean_up_worktree(&path, &branch, cx),
             FileAction::Rollback(path) => self.rollback_file(&path, window, cx),
             FileAction::RenameSymbol(plan) => self.apply_rename(&plan, &typed, window, cx),
             FileAction::NewBranch => {
@@ -340,6 +346,15 @@ impl Workspace {
                 ),
                 false,
             ),
+            FileAction::RemoveWorktree(path) => ("删除工作树", self.remove_worktree_detail(path), true),
+            FileAction::CleanupWorktree(path, branch) => (
+                "合并完成",
+                format!(
+                    "改动已在主分支上。删除工作树 {} 和分支 {branch}？",
+                    path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+                ),
+                true,
+            ),
             FileAction::Rollback(path) => (
                 "回滚",
                 format!("将 {path} 恢复为上次提交的版本。未提交的修改将丢失，新文件将移到回收站。"),
@@ -379,7 +394,10 @@ impl Workspace {
                     .child(
                         Button::new("file-prompt-cancel")
                             .small()
-                            .label("取消")
+                            .label(match &prompt.action {
+                                FileAction::CleanupWorktree(..) => "保留",
+                                _ => "取消",
+                            })
                             .on_click(cx.listener(|this, _, window, cx| this.close_file_prompt(window, cx))),
                     )
                     .child(
@@ -389,7 +407,7 @@ impl Workspace {
                             .when(!delete, |button| button.primary())
                             .label(match &prompt.action {
                                 FileAction::Rollback(_) => "回滚",
-                                FileAction::Delete(_) => "删除",
+                                FileAction::Delete(_) | FileAction::RemoveWorktree(_) | FileAction::CleanupWorktree(..) => "删除",
                                 _ => "确定",
                             })
                             .on_click(cx.listener(|this, _, window, cx| this.confirm_file_prompt(window, cx))),

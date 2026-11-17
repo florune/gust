@@ -433,7 +433,7 @@ impl Workspace {
         }
         self.close_palette(window, cx);
         if self.notice.is_none() {
-            self.notice = Some(format!("已替换 {count} 处，{changed} 个文件").into());
+            self.inform(format!("已替换 {count} 处，{changed} 个文件"), cx);
         }
         cx.notify();
     }

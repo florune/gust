@@ -129,7 +129,7 @@ impl Workspace {
         self.change_keymap(cx, |keymap| taken = assign(keymap, id, key));
         if !taken.is_empty() {
             let from: Vec<String> = taken.iter().map(|label| format!("「{label}」")).collect();
-            self.notice = Some(format!("{} 已从{}移除", display_key(key), from.join("、")).into());
+            self.inform(format!("{} 已从{}移除", display_key(key), from.join("、")), cx);
         }
     }
 
