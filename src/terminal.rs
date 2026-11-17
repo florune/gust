@@ -684,6 +684,25 @@ impl Palette {
                 0x57606a, 0xa40e26, 0x1a7f37, 0x633c01, 0x218bff, 0xa475f9, 0x3192aa, 0x8c959f,
             ]
         };
+        // The six colors take the theme's own, so programs' output matches it.
+        let mut ansi = ansi;
+        let hex = |color: Hsla| {
+            let rgba = gpui_kit::Rgba::from(color);
+            let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u32;
+            channel(rgba.r) << 16 | channel(rgba.g) << 8 | channel(rgba.b)
+        };
+        let colors = [
+            (theme.red, theme.red_light),
+            (theme.green, theme.green_light),
+            (theme.yellow, theme.yellow_light),
+            (theme.blue, theme.blue_light),
+            (theme.magenta, theme.magenta_light),
+            (theme.cyan, theme.cyan_light),
+        ];
+        for (ix, (normal, bright)) in colors.into_iter().enumerate() {
+            ansi[ix + 1] = hex(normal);
+            ansi[ix + 9] = hex(bright);
+        }
         Self {
             ansi,
             foreground: theme.foreground,

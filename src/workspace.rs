@@ -25,6 +25,7 @@ mod action_search;
 mod app_menu;
 mod autoscroll;
 mod blame;
+mod bracket_view;
 mod changes;
 mod compare_view;
 mod file_ops;
@@ -35,6 +36,7 @@ mod commands;
 mod conflict;
 mod editing;
 mod layout;
+mod lens;
 mod log;
 mod markdown;
 mod merge_view;
@@ -156,6 +158,10 @@ struct Doc {
     /// Who last changed each line, for the note after the caret's line.
     blame: Rc<crate::history::Blame>,
     blame_task: Task<()>,
+    /// How often its declarations are used, for the notes after them.
+    lenses: lens::Lenses,
+    /// Its brackets, colored by depth.
+    brackets: bracket_view::DocBrackets,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -230,6 +236,8 @@ pub struct Workspace {
     settings_page: Option<FocusHandle>,
     /// The shortcuts page, while it is open.
     keymap_page: Option<keymap_view::KeymapPage>,
+    /// Bumped when a save or a change on disk may change usage counts.
+    lens_generation: u64,
     /// The About box, while it is open.
     about: Option<FocusHandle>,
     /// Wheel movement with Ctrl not yet large enough to change the font size.
@@ -375,6 +383,7 @@ impl Workspace {
             app: settings::load_app(),
             settings_page: None,
             keymap_page: None,
+            lens_generation: 0,
             about: None,
             zoom_remainder: 0.,
             amend: false,
@@ -474,6 +483,7 @@ impl Workspace {
 
     pub(super) fn files_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.project_files = None;
+        self.lenses_out_of_date(cx);
         self.tree.update(cx, |tree, cx| {
             tree.reload();
             cx.notify();
@@ -661,9 +671,12 @@ impl Workspace {
             conflict: None,
             blame: Rc::default(),
             blame_task: Task::ready(()),
+            lenses: Default::default(),
+            brackets: Default::default(),
             _subscriptions: subscriptions,
         });
         self.refresh_outline(self.docs.len() - 1, true, cx);
+        self.refresh_brackets(self.docs.len() - 1, cx);
         let opened = self.docs[self.docs.len() - 1].path.clone();
         self.check_package(&opened, cx);
         if to_split {
@@ -809,6 +822,7 @@ impl Workspace {
         self.refresh_gutter(ix, cx);
         self.update_preview(ix, cx);
         self.refresh_outline(ix, false, cx);
+        self.refresh_brackets(ix, cx);
         self.refresh_blame(ix, false, cx);
         let path = self.docs[ix].path.clone();
         self.refresh_disk_compare(&path, cx);
@@ -839,6 +853,9 @@ impl Workspace {
                 doc.conflict = None;
                 let saved = doc.path.clone();
                 let written = doc.saved.clone();
+                if doc.language == "go" {
+                    self.lenses_out_of_date(cx);
+                }
                 self.check_package(&saved, cx);
                 self.stage_if_resolved(&saved, &written, cx);
                 self.refresh_git(cx);

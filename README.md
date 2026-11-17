@@ -40,6 +40,8 @@ cargo build --release
 - 补全：局部变量、包内符号、结构体字段与方法、导入包（含标准库与依赖）的成员。
 - 跳转到定义，可跨文件、跨包。
 - 用法与实现：列出函数、方法、类型、字段、变量的引用；接口及接口方法同时列出实现。
+- 彩色括号：按嵌套层级为括号着色，没有配对的括号标红；光标在括号旁时，它和配对的另一半一起框出。字符串与注释中的括号不计入。
+- 用法数量：函数、方法、类型的声明行末尾显示用法数量，接口及接口方法另显示实现数量；点击列出全部位置。保存文件后更新，可在设置中关闭。
 - 文件结构：列出当前 Go 文件的声明；状态栏显示光标所在的函数。
 - 按名称查找符号：在整个项目中查找类型、函数、方法、变量、常量，支持 `类型.方法` 形式。
 - 快速文档：悬停或按 `Ctrl+Q` 显示声明及其注释。
@@ -80,7 +82,7 @@ cargo build --release
 - 最近项目列表；打开其他项目时可选择当前窗口或新窗口。
 - Markdown 预览：源码、预览、并排三种视图，支持预览内查找。
 - 内置终端：多标签、输入法、选择与复制。
-- 深色与浅色主题。
+- 主题：深色有 Gust Dark、One Dark、Dracula、Nord、Tokyo Night、Catppuccin Mocha、Gruvbox Dark、Solarized Dark；浅色有 Gust Light、GitHub Light、One Light、Solarized Light、Catppuccin Latte、Gruvbox Light。深色与浅色各记住一个，活动栏底部的按钮在两者之间切换；终端颜色随主题变化。
 - 应用菜单：点击标题栏左上角的图标，打开设置、快捷键、配置文件夹与「关于」。
 - 设置（`Ctrl+Alt+S`）：主题、代码字号、保存时格式化、行内 blame、悬停文档；在编辑器中按住 `Ctrl` 滚动滚轮可调整字号。
 - 操作搜索（`Ctrl+Shift+A`）：按名称查找并执行所有命令。
@@ -160,6 +162,8 @@ cargo test
 | `src/workspace/split.rs` | 分屏 |
 | `src/workspace/palette.rs` | 查找框与列表 |
 | `src/workspace/usages.rs` | 用法与实现 |
+| `src/workspace/lens.rs` | 声明后的用法数量 |
+| `src/workspace/bracket_view.rs`、`src/brackets.rs` | 彩色括号与配对括号 |
 | `src/workspace/outline.rs` | 文件结构 |
 | `src/workspace/navigation.rs` | 导航历史与鼠标操作 |
 | `src/workspace/editing.rs` | 行操作与最近文件 |
@@ -200,5 +204,5 @@ cargo test
 | `src/file_tree.rs` | 文件树 |
 | `src/terminal.rs` | 终端 |
 | `src/settings.rs`、`src/recent.rs` | 设置与最近项目 |
-| `src/theme.rs` | 主题 |
+| `src/theme.rs`、`src/schemes.rs` | 主题与配色方案 |
 | `assets/` | 应用图标 |

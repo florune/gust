@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct AppSettings {
     pub dark: bool,
+    /// The themes of the dark and the light mode, by name.
+    pub dark_theme: String,
+    pub light_theme: String,
     /// Size of the code font, in points.
     pub font_size: f32,
     /// Format Go files when they are saved.
@@ -18,6 +21,10 @@ pub struct AppSettings {
     pub blame: bool,
     /// Show documentation when the pointer rests on a name.
     pub hover_docs: bool,
+    /// After declarations, how often they are used and implemented.
+    pub code_lens: bool,
+    /// Brackets in color by depth, and the pair at the caret marked.
+    pub bracket_colors: bool,
     /// Shortcuts the user chose, by command; commands not listed keep their defaults.
     pub keymap: std::collections::BTreeMap<String, Vec<String>>,
 }
@@ -26,10 +33,14 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             dark: true,
+            dark_theme: "Gust Dark".to_string(),
+            light_theme: "Gust Light".to_string(),
             font_size: 14.,
             format_on_save: true,
             blame: true,
             hover_docs: true,
+            code_lens: true,
+            bracket_colors: true,
             keymap: Default::default(),
         }
     }

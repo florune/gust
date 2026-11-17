@@ -646,6 +646,8 @@ impl Workspace {
                 .flex_1()
                 .min_h_0()
                 .child(editor(&doc.editor))
+                .children(self.render_bracket_match(ix, cx))
+                .children(self.render_lens_layer(ix, cx))
                 .children(self.render_blame_layer(ix, cx))
                 .children(self.render_test_markers(ix, cx))
                 .into_any_element();

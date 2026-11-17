@@ -1878,6 +1878,139 @@ pub fn usages(
     Some(out)
 }
 
+/// What one declaration of a file is referred to by, for the note after it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lens {
+    /// The declaration, as [`OutlineItem::full_name`] names it.
+    pub key: String,
+    /// For an interface or one of its methods: how many types implement it.
+    pub implementations: Option<usize>,
+    pub usages: usize,
+}
+
+/// Functions the toolchain calls by themselves, which no code refers to.
+fn called_by_toolchain(symbol: &Symbol, file: &Path) -> bool {
+    if symbol.kind != Kind::Func {
+        return false;
+    }
+    let test_file = file.to_string_lossy().ends_with("_test.go");
+    symbol.name == "main"
+        || symbol.name == "init"
+        || (test_file
+            && ["Test", "Benchmark", "Example", "Fuzz"]
+                .iter()
+                .any(|prefix| symbol.name.starts_with(prefix)))
+}
+
+/// How often each function, method, and type declared in `source` is used
+/// in `files`, and how many types implement each interface and its methods.
+/// Uses are found and resolved the way [`usages`] does, for all of them at once.
+pub fn lenses(
+    index: &Index,
+    files: &[PathBuf],
+    open: &HashMap<PathBuf, String>,
+    file: &Path,
+    source: &str,
+) -> Vec<Lens> {
+    let Some(tree) = parse(source) else {
+        return Vec::new();
+    };
+    let (_, symbols) = file_symbols(source, &tree, &Arc::from(file));
+    let interfaces: HashSet<&str> = symbols
+        .iter()
+        .filter(|s| s.kind == Kind::Type && s.detail == "interface")
+        .map(|s| s.name.as_str())
+        .collect();
+    let mut targets: Vec<&Symbol> = symbols
+        .iter()
+        .filter(|s| matches!(s.kind, Kind::Func | Kind::Method | Kind::Type))
+        .filter(|s| !called_by_toolchain(s, file))
+        .collect();
+    targets.sort_by_key(|s| (s.row, s.col));
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+    // Unexported names are only looked for in their own package.
+    let names: HashMap<&str, bool> = targets
+        .iter()
+        .map(|s| (s.name.as_str(), exported(&s.name)))
+        .collect();
+    let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
+
+    let mut candidates: Vec<PathBuf> = files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "go"))
+        .cloned()
+        .collect();
+    candidates.push(file.to_path_buf());
+    candidates.sort();
+    candidates.dedup();
+    for path in &candidates {
+        let same_package = path.parent() == Some(dir.as_path());
+        let content = if path == file {
+            Some(source.to_string())
+        } else {
+            open.get(path).cloned().or_else(|| std::fs::read_to_string(path).ok())
+        };
+        let Some(content) = content else {
+            continue;
+        };
+        let present: HashSet<&str> = names
+            .iter()
+            .filter(|(name, exported)| (**exported || same_package) && contains_word(&content, name))
+            .map(|(name, _)| *name)
+            .collect();
+        if present.is_empty() {
+            continue;
+        }
+        let Some(tree) = parse(&content) else {
+            continue;
+        };
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+            if !NAME_KINDS.contains(&node.kind()) || !present.contains(text(node, &content)) {
+                continue;
+            }
+            let position = node.start_position();
+            let at = (position.row as u32, position.column as u32);
+            if path == file && targets.iter().any(|s| (s.row, s.col) == at) {
+                continue;
+            }
+            if let Some(found) = definition_in(index, path, &content, &tree, node.start_byte())
+                && found.file == file
+            {
+                *counts.entry((found.row, found.col)).or_default() += 1;
+            }
+        }
+    }
+
+    targets
+        .into_iter()
+        .map(|symbol| {
+            let implemented = match (symbol.kind, &symbol.owner) {
+                (Kind::Type, None) if symbol.detail == "interface" => {
+                    Some(implementations(index, files, file, &symbol.name, None).len())
+                }
+                (Kind::Method, Some(owner)) if interfaces.contains(owner.as_str()) => {
+                    Some(implementations(index, files, file, owner, Some(&symbol.name)).len())
+                }
+                _ => None,
+            };
+            Lens {
+                key: match &symbol.owner {
+                    Some(owner) => format!("{owner}.{}", symbol.name),
+                    None => symbol.name.clone(),
+                },
+                implementations: implemented,
+                usages: counts.get(&(symbol.row, symbol.col)).copied().unwrap_or(0),
+            }
+        })
+        .collect()
+}
+
 /// How many parameters and results a signature has; `None` when it was cut short.
 fn arity(signature: &str) -> Option<(usize, usize)> {
     if signature.ends_with('…') {
@@ -2815,6 +2948,74 @@ mod tests {
             implementations,
             [at("infra/client.go", 4), at("service/fake_test.go", 4)]
         );
+    }
+
+    #[test]
+    fn lenses_count_what_the_usages_list_shows() {
+        let fixture = Fixture::new(
+            "lenses",
+            &[
+                GO_MOD,
+                (
+                    "port/port.go",
+                    "package port
+
+type Store interface {
+	Load(id string) (int64, error)
+}
+
+func helper() {}
+
+func Use(s Store) {
+	helper()
+	s.Load(\"a\")
+	s.Load(\"b\")
+}
+",
+                ),
+                (
+                    "infra/client.go",
+                    "package infra
+
+import \"example.com/demo/port\"
+
+type Client struct{}
+
+func (c *Client) Load(id string) (int64, error) { return 0, nil }
+
+func init() { port.Use(&Client{}) }
+",
+                ),
+            ],
+        );
+        let path = fixture.root.join("port/port.go");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let files: Vec<PathBuf> = crate::finder::project_files(&fixture.root, &[])
+            .into_iter()
+            .map(|relative| fixture.root.join(relative))
+            .collect();
+        let found = lenses(&fixture.index, &files, &HashMap::new(), &path, &source);
+        let shown: Vec<(&str, Option<usize>, usize)> = found
+            .iter()
+            .map(|lens| (lens.key.as_str(), lens.implementations, lens.usages))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("Store", Some(1), 1),
+                ("Store.Load", Some(1), 2),
+                ("helper", None, 1),
+                ("Use", None, 1),
+            ]
+        );
+        // The toolchain's own entry points get none.
+        let client = fixture.root.join("infra/client.go");
+        let source = std::fs::read_to_string(&client).unwrap();
+        let keys: Vec<String> = lenses(&fixture.index, &files, &HashMap::new(), &client, &source)
+            .into_iter()
+            .map(|lens| lens.key)
+            .collect();
+        assert_eq!(keys, ["Client", "Client.Load"]);
     }
 
     #[test]

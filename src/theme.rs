@@ -301,31 +301,52 @@ const MONO_FONTS: &[&str] = &[
     "Consolas",
 ];
 
-/// Register Gust's themes and switch to `mode`.
-pub fn init(mode: ThemeMode, cx: &mut App) {
-    ThemeRegistry::global_mut(cx)
-        .load_themes_from_str(THEMES)
-        .expect("Gust's own themes parse");
+/// The coding font found installed, given to every theme.
+static MONO_FONT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Register the themes, use `dark` and `light` for the two modes, and switch to `mode`.
+pub fn init(mode: ThemeMode, dark: &str, light: &str, cx: &mut App) {
+    let registry = ThemeRegistry::global_mut(cx);
+    registry.load_themes_from_str(THEMES).expect("Gust's own themes parse");
+    registry
+        .load_themes_from_str(&crate::schemes::generated())
+        .expect("generated themes parse");
     let installed = cx.text_system().all_font_names();
     let mono = MONO_FONTS
         .iter()
         .find(|font| installed.iter().any(|name| name == *font))
         .map(|font| font.to_string());
+    let _ = MONO_FONT.set(mono);
+    set_themes(dark, light, cx);
+    change(mode, cx);
+    // Scrollbars stay in view, as in GoLand, instead of fading after a scroll.
+    Theme::set_scrollbar_mode(gpui_kit::component::scroll::ScrollbarMode::Always, cx);
+}
 
+/// Use the themes named `dark` and `light`; an unknown name falls back to Gust's own.
+/// Takes effect with the next [`change`].
+pub fn set_themes(dark: &str, light: &str, cx: &mut App) {
     let registry = ThemeRegistry::global(cx);
-    let mut dark = (*registry.themes()[DARK]).clone();
-    let mut light = (*registry.themes()[LIGHT]).clone();
-    if let Some(mono) = mono {
-        dark.mono_font_family = Some(mono.clone().into());
-        light.mono_font_family = Some(mono.into());
-    }
+    let themes = registry.themes();
+    let pick = |name: &str, fallback: &str| {
+        let mut theme = (**themes.get(name).or_else(|| themes.get(fallback))?).clone();
+        if let Some(Some(mono)) = MONO_FONT.get() {
+            theme.mono_font_family = Some(mono.clone().into());
+        }
+        Some(theme)
+    };
+    let (Some(dark), Some(light)) = (pick(dark, DARK), pick(light, LIGHT)) else {
+        return;
+    };
     Theme::update(cx, |theme| {
         theme.dark_theme = dark.into();
         theme.light_theme = light.into();
     });
-    change(mode, cx);
-    // Scrollbars stay in view, as in GoLand, instead of fading after a scroll.
-    Theme::set_scrollbar_mode(gpui_kit::component::scroll::ScrollbarMode::Always, cx);
+}
+
+/// The scheme of the theme in use.
+fn scheme(cx: &App) -> Option<&'static crate::schemes::Scheme> {
+    crate::schemes::find(gpui_kit::component::ActiveTheme::theme(cx).theme_name())
 }
 
 /// Switch between the dark and the light theme.
@@ -335,15 +356,20 @@ pub fn change(mode: ThemeMode, cx: &mut App) {
     // Loading a theme caps the selection at 30% opacity, which leaves it
     // faint next to GoLand's; selections are drawn under the text, so a
     // stronger one hides nothing.
+    let selection = scheme(cx).filter(|scheme| !scheme.handmade).map(|scheme| {
+        Hsla::from(rgb(scheme.selection)).opacity(if scheme.dark { 0.85 } else { 0.45 })
+    });
     Theme::update(cx, |theme| {
         if size > 0. {
             theme.mono_font_size = gpui_kit::px(size);
         }
-        theme.selection = if theme.is_dark() {
-            Hsla::from(rgb(0x2d5fbf)).opacity(0.5)
-        } else {
-            Hsla::from(rgb(0x3d8ef0)).opacity(0.4)
-        };
+        theme.selection = selection.unwrap_or_else(|| {
+            if theme.is_dark() {
+                Hsla::from(rgb(0x2d5fbf)).opacity(0.5)
+            } else {
+                Hsla::from(rgb(0x3d8ef0)).opacity(0.4)
+            }
+        });
     });
     cx.refresh_windows();
 }
@@ -358,7 +384,7 @@ pub fn set_font_size(size: f32, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// Colors that mean the same thing in both themes: file kinds and git states.
+/// Colors that mean the same thing in every theme: file kinds and git states.
 pub struct Palette {
     pub blue: Hsla,
     pub green: Hsla,
@@ -371,6 +397,19 @@ pub struct Palette {
 }
 
 pub fn palette(cx: &App) -> Palette {
+    if let Some(scheme) = scheme(cx) {
+        let color = |value: u32| -> Hsla { rgb(value).into() };
+        return Palette {
+            blue: color(scheme.blue),
+            green: color(scheme.green),
+            red: color(scheme.red),
+            yellow: color(scheme.yellow),
+            purple: color(scheme.magenta),
+            cyan: color(scheme.cyan),
+            orange: color(scheme.orange),
+            gray: color(scheme.muted),
+        };
+    }
     let theme = gpui_kit::component::ActiveTheme::theme(cx);
     let dark = theme.is_dark();
     let pick = |dark_color: u32, light_color: u32| -> Hsla {

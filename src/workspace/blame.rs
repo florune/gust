@@ -79,12 +79,26 @@ impl Workspace {
             ..Default::default()
         };
         let font_size = theme.mono_font_size;
+        // A count after the line comes first; the note follows it.
+        let counts: std::collections::HashMap<u32, SharedString> = self
+            .lens_notes(ix)
+            .into_iter()
+            .map(|(row, _, note)| (row, note))
+            .collect();
+        let count_font = Font {
+            family: theme.mono_font_family.clone(),
+            ..Default::default()
+        };
         Some(
             canvas(
                 |_, _, _| (),
                 move |bounds, _, window, cx| {
                     let state = editor.read(cx);
                     let row = state.cursor_position().line as usize;
+                    // A caret scrolled away would be placed on the first row shown.
+                    if !state.visible_row_range().is_some_and(|rows| rows.contains(&row)) {
+                        return;
+                    }
                     let end = state.text().line_end_offset(row);
                     let Some(at) = state.range_to_bounds(&(end..end)) else {
                         return;
@@ -102,7 +116,20 @@ impl Workspace {
                     let line = window
                         .text_system()
                         .shape_line(note.clone(), text_size, &[run], None);
-                    let origin = point(at.origin.x + text_size * GAP, at.origin.y);
+                    let mut origin = point(at.origin.x + text_size * GAP, at.origin.y);
+                    if let Some(count) = counts.get(&(row as u32)) {
+                        let count_size = text_size * 0.9;
+                        let run = TextRun {
+                            len: count.len(),
+                            font: count_font.clone(),
+                            color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let width = window.text_system().shape_line(count.clone(), count_size, &[run], None).width;
+                        origin.x = at.origin.x + count_size * super::lens::GAP + width + text_size * GAP;
+                    }
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
                         let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);
                     });

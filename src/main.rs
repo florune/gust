@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod brackets;
 mod compare;
 mod expand;
 mod complete;
@@ -18,6 +19,7 @@ mod problems;
 mod proc;
 mod recent;
 mod run;
+mod schemes;
 mod settings;
 mod terminal;
 mod theme;
@@ -58,7 +60,12 @@ fn main() {
             gpui_kit::init(cx);
             let app = settings::load_app();
             theme::set_font_size(app.font_size, cx);
-            theme::init(if app.dark { ThemeMode::Dark } else { ThemeMode::Light }, cx);
+            theme::init(
+                if app.dark { ThemeMode::Dark } else { ThemeMode::Light },
+                &app.dark_theme,
+                &app.light_theme,
+                cx,
+            );
             complete::set_hover_docs(app.hover_docs);
             workspace::init(cx);
             terminal::init(cx);

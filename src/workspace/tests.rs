@@ -2381,3 +2381,113 @@ fn the_keymap_page_rebinds_a_command(cx: &mut TestAppContext) {
     fixture.press("ctrl-s", cx);
     assert!(!fixture.dirty(cx));
 }
+
+#[gpui_kit::test]
+fn counts_after_declarations_open_the_usages_list(cx: &mut TestAppContext) {
+    let port = "package port\n\ntype Store interface {\n\tLoad(id string) (int64, error)\n}\n\nfunc Use(s Store) {\n\ts.Load(\"a\")\n}\n";
+    let fixture = Fixture::new(
+        cx,
+        "lens",
+        &[
+            GO_MOD,
+            ("port/port.go", port),
+            (
+                "infra/client.go",
+                "package infra\n\ntype Client struct{}\n\nfunc (c *Client) Load(id string) (int64, error) { return 0, nil }\n",
+            ),
+        ],
+        "port/port.go",
+    );
+    let notes = |cx: &mut TestAppContext| {
+        cx.executor().advance_clock(std::time::Duration::from_millis(300));
+        fixture.settle(cx);
+        fixture.workspace.read_with(cx, |workspace, _| {
+            let active = workspace.active.unwrap();
+            workspace
+                .lens_notes(active)
+                .into_iter()
+                .map(|(row, _, note)| (row, note.to_string()))
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(
+        notes(cx),
+        [
+            (2, "1 个实现 · 1 处用法".to_string()),
+            (3, "1 个实现 · 1 处用法".to_string()),
+            (6, "无用法".to_string()),
+        ]
+    );
+
+    // A click on the note lists the single use instead of going there.
+    let end = port.find("error)").unwrap() + "error)".len();
+    let at = fixture.point_of(end..end, cx);
+    fixture.click(gpui_kit::point(at.x + px(60.), at.y), None, gpui_kit::Modifiers::default(), cx);
+    assert_eq!(palette_rows(&fixture, cx), [("infra/client.go".to_string(), 4, "实现"), ("port/port.go".to_string(), 7, "")]);
+
+    // A new use counts once the file is saved.
+    fixture.press("escape", cx);
+    fixture.set_cursor(8, 0, cx);
+    fixture.input("\nfunc again(s Store) { s.Load(\"b\") }\n", cx);
+    fixture.press("ctrl-s", cx);
+    assert!(notes(cx).contains(&(3, "1 个实现 · 2 处用法".to_string())));
+}
+
+#[gpui_kit::test]
+fn a_chosen_theme_is_kept_for_its_mode(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "themes", &[GO_MOD, ("main.go", "package main\n")], "main.go");
+    let name = |cx: &mut TestAppContext| {
+        cx.update(|cx| gpui_kit::component::ActiveTheme::theme(cx).theme_name().to_string())
+    };
+    cx.update(|cx| {
+        crate::theme::init(gpui_kit::component::ThemeMode::Dark, "Gust Dark", "Gust Light", cx)
+    });
+    assert_eq!(name(cx), "Gust Dark");
+
+    fixture.update(cx, |workspace, _, cx| {
+        workspace.change_app_settings(cx, |app| {
+            app.dark = true;
+            app.dark_theme = "Nord".to_string();
+        })
+    });
+    assert_eq!(name(cx), "Nord");
+    let blue = cx.update(|cx| crate::theme::palette(cx).blue);
+    assert_eq!(blue, gpui_kit::rgb(0x81a1c1).into());
+
+    fixture.update(cx, |workspace, _, cx| {
+        workspace.change_app_settings(cx, |app| {
+            app.dark = false;
+            app.light_theme = "Solarized Light".to_string();
+        })
+    });
+    assert_eq!(name(cx), "Solarized Light");
+
+    // The theme button goes back to the dark theme chosen before.
+    fixture.update(cx, |workspace, window, cx| workspace.on_toggle_theme(&super::ToggleTheme, window, cx));
+    assert_eq!(name(cx), "Nord");
+
+    fixture.update(cx, |workspace, _, cx| {
+        workspace.change_app_settings(cx, |app| *app = crate::settings::AppSettings::default())
+    });
+}
+
+#[gpui_kit::test]
+fn brackets_follow_edits_and_pair_up_at_the_caret(cx: &mut TestAppContext) {
+    let source = "package main\n\nfunc main() { f(a[1]) }\n";
+    let fixture = Fixture::new(cx, "brackets", &[GO_MOD, ("main.go", source)], "main.go");
+    let scan = |cx: &mut TestAppContext| {
+        fixture.workspace.read_with(cx, |workspace, _| {
+            workspace.docs[workspace.active.unwrap()].brackets.scan.clone()
+        })
+    };
+    assert_eq!(scan(cx).all.len(), 8);
+    let open = source.find("f(").unwrap() + 1;
+    let close = source.find("])").unwrap() + 1;
+    assert_eq!(scan(cx).pair_at(open), Some((open, close)));
+
+    // A bracket typed in a string is not one.
+    fixture.set_cursor(2, 14, cx);
+    fixture.input("s := \"(\"; ", cx);
+    assert_eq!(scan(cx).all.len(), 8);
+    assert!(scan(cx).all.iter().all(|bracket| bracket.depth.is_some()));
+}

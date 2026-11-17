@@ -183,8 +183,11 @@ impl Workspace {
         let input = editor.input_bounds();
         let height = editor.line_height().unwrap_or(px(20.));
         let color = crate::theme::palette(cx).green;
+        // Rows off screen would be placed on the first one shown.
+        let visible = editor.visible_row_range().unwrap_or_default();
         let markers: Vec<AnyElement> = tests
             .into_iter()
+            .filter(|(row, _)| visible.contains(&(*row as usize)))
             .filter_map(|(row, name)| {
                 let start = editor.text().line_start_offset(row as usize);
                 let line = editor.range_to_bounds(&(start..start))?;

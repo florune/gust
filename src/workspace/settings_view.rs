@@ -1,14 +1,15 @@
-//! The settings page (Ctrl+Alt+S): theme, code font size, formatting on
+//! The settings page (Ctrl+Alt+S): color themes, code font size, formatting on
 //! save, inline blame, hover documentation. Ctrl+wheel over an editor
 //! changes the font size as well.
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, ThemeMode, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::Workspace;
+use crate::schemes::{SCHEMES, Scheme};
 use crate::settings::{self, AppSettings, FONT_SIZES};
 use crate::ui::{UI_SMALL, UI_TEXT};
 
@@ -52,8 +53,15 @@ impl Workspace {
         if app.font_size != before.font_size {
             crate::theme::set_font_size(app.font_size, cx);
         }
-        if app.dark != before.dark {
+        let themes_changed = app.dark_theme != before.dark_theme || app.light_theme != before.light_theme;
+        if themes_changed {
+            crate::theme::set_themes(&app.dark_theme, &app.light_theme, cx);
+        }
+        if app.dark != before.dark || themes_changed {
             crate::theme::change(if app.dark { ThemeMode::Dark } else { ThemeMode::Light }, cx);
+        }
+        if app.dark != before.dark || app.bracket_colors != before.bracket_colors {
+            self.refresh_all_brackets(cx);
         }
         crate::complete::set_hover_docs(app.hover_docs);
         if let Err(reason) = settings::save_app(&app) {
@@ -141,23 +149,77 @@ impl Workspace {
                 }))
                 .into_any_element()
         };
-        let theme_choice = h_flex()
-            .gap_1()
-            .child(
-                Button::new("settings-dark")
-                    .small()
-                    .when(app.dark, |button| button.primary())
-                    .label("深色")
-                    .on_click(cx.listener(|this, _, _, cx| this.change_app_settings(cx, |app| app.dark = true))),
-            )
-            .child(
-                Button::new("settings-light")
-                    .small()
-                    .when(!app.dark, |button| button.primary())
-                    .label("浅色")
-                    .on_click(cx.listener(|this, _, _, cx| this.change_app_settings(cx, |app| app.dark = false))),
-            )
-            .into_any_element();
+        // A miniature of each theme: its sidebar, background, and a few lines of code.
+        let card = |scheme: &'static Scheme| {
+            let chosen = if scheme.dark { app.dark_theme == scheme.name } else { app.light_theme == scheme.name };
+            let in_use = chosen && app.dark == scheme.dark;
+            let bar = |color: u32, width: f32| div().h(px(4.)).w(px(width)).rounded(px(2.)).bg(rgb(color));
+            let code = &scheme.syntax;
+            v_flex()
+                .id(SharedString::from(format!("theme-{}", scheme.name)))
+                .w(px(124.))
+                .gap_1()
+                .cursor_pointer()
+                .child(
+                    h_flex()
+                        .h(px(56.))
+                        .rounded(theme.radius)
+                        .border_2()
+                        .border_color(if chosen { theme.ring } else { theme.border })
+                        .overflow_hidden()
+                        .child(div().w(px(20.)).h_full().bg(rgb(scheme.panel)))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .h_full()
+                                .p_1p5()
+                                .gap(px(5.))
+                                .bg(rgb(scheme.background))
+                                .child(h_flex().gap_1().child(bar(code.keyword, 16.)).child(bar(code.function, 34.)))
+                                .child(h_flex().gap_1().pl_2().child(bar(code.ty, 20.)).child(bar(code.string, 38.)))
+                                .child(h_flex().gap_1().pl_2().child(bar(code.number, 12.)).child(bar(code.constant, 26.)))
+                                .child(h_flex().pl_2().child(bar(code.comment, 52.))),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(UI_SMALL)
+                        .text_color(if in_use { theme.foreground } else { theme.muted_foreground })
+                        .when(in_use, |name| name.font_weight(FontWeight::SEMIBOLD))
+                        .child(scheme.name),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.change_app_settings(cx, |app| {
+                        app.dark = scheme.dark;
+                        if scheme.dark {
+                            app.dark_theme = scheme.name.to_string();
+                        } else {
+                            app.light_theme = scheme.name.to_string();
+                        }
+                    })
+                }))
+        };
+        let themes = |dark: bool| {
+            h_flex()
+                .flex_wrap()
+                .gap_3()
+                .children(SCHEMES.iter().filter(|scheme| scheme.dark == dark).map(card))
+        };
+        let theme_section = |title: &'static str, dark: bool| {
+            v_flex()
+                .py_2()
+                .gap_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(div().text_size(UI_TEXT).child(title))
+                .child(themes(dark))
+        };
+        let theme_hint = div()
+            .pt_2()
+            .text_size(UI_SMALL)
+            .text_color(theme.muted_foreground)
+            .child("深色与浅色各记住一个主题，活动栏底部的按钮在两者之间切换。");
+
         let font = h_flex()
             .gap_2()
             .child(
@@ -186,7 +248,9 @@ impl Workspace {
             .key_context("Settings")
             .track_focus(focus)
             .occlude()
-            .w(px(520.))
+            .w(px(600.))
+            .max_h(px(640.))
+            .overflow_y_scroll()
             .p_4()
             .bg(theme.popover)
             .border_1()
@@ -206,7 +270,9 @@ impl Workspace {
                         ),
                     ),
             )
-            .child(row("主题", "", theme_choice))
+            .child(theme_hint)
+            .child(theme_section("深色主题", true))
+            .child(theme_section("浅色主题", false))
             .child(row("代码字号", "在编辑器中按住 Ctrl 滚动鼠标滚轮也可调整", font))
             .child(row(
                 "保存时格式化",
@@ -222,6 +288,16 @@ impl Workspace {
                 "悬停显示文档",
                 "鼠标停留在名称上时显示声明与注释",
                 check("settings-hover", app.hover_docs, |app, on| app.hover_docs = on),
+            ))
+            .child(row(
+                "用法与实现数量",
+                "在函数、方法、类型的声明行末尾显示用法数量，接口另显示实现数量",
+                check("settings-lens", app.code_lens, |app, on| app.code_lens = on),
+            ))
+            .child(row(
+                "彩色括号",
+                "按嵌套层级为括号着色；光标在括号旁时标出与之配对的另一半",
+                check("settings-brackets", app.bracket_colors, |app, on| app.bracket_colors = on),
             ));
         Some(
             div()

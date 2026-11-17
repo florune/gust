@@ -41,7 +41,7 @@ impl Workspace {
             return;
         }
         let (path, offset) = (doc.path.clone(), doc.editor.read(cx).cursor());
-        self.find_usages(path, offset, window, cx);
+        self.find_usages(path, offset, false, window, cx);
     }
 
     /// Usages of the name at `row` and byte column `col` of the open file `path`.
@@ -57,10 +57,27 @@ impl Workspace {
             return;
         };
         let offset = offset_of(&doc.editor.read(cx).text().to_string(), row, col);
-        self.find_usages(path, offset, window, cx);
+        self.find_usages(path, offset, false, window, cx);
     }
 
-    fn find_usages(&mut self, path: PathBuf, offset: usize, _: &mut Window, cx: &mut Context<Self>) {
+    /// The list of usages of the declaration at `row` and `col` of the open file
+    /// `path`, even when there is a single one.
+    pub(super) fn list_usages_at(
+        &mut self,
+        path: PathBuf,
+        row: u32,
+        col: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(doc) = self.docs.iter().find(|doc| doc.path == path) else {
+            return;
+        };
+        let offset = offset_of(&doc.editor.read(cx).text().to_string(), row, col);
+        self.find_usages(path, offset, true, window, cx);
+    }
+
+    fn find_usages(&mut self, path: PathBuf, offset: usize, list: bool, _: &mut Window, cx: &mut Context<Self>) {
         let open: HashMap<PathBuf, String> = self
             .docs
             .iter()
@@ -85,7 +102,7 @@ impl Workspace {
             let (files, found) = searching.await;
             this.update_in(cx, |this, window, cx| {
                 this.project_files = Some(files);
-                this.show_usages(found, window, cx);
+                this.show_usages(found, list, window, cx);
             })
             .ok();
         });
@@ -94,6 +111,7 @@ impl Workspace {
     fn show_usages(
         &mut self,
         found: Option<goindex::Usages>,
+        list: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -128,7 +146,7 @@ impl Workspace {
                 cx.notify();
             }
             // Like GoLand, a single place is simply gone to.
-            [only] => {
+            [only] if !list => {
                 let (path, row, col) = (self.root.join(&only.path), only.row, only.col);
                 self.open_at(path, row, col, window, cx);
             }
