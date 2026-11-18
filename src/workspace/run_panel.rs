@@ -101,6 +101,8 @@ pub(super) struct ConfigEditor {
     root: PathBuf,
     /// Where the program runs when the form leaves the folder empty.
     default_dir: SharedString,
+    /// Why the configurations cannot be saved as they are.
+    pub error: Option<SharedString>,
     _package_changed: Option<Subscription>,
 }
 
@@ -118,8 +120,8 @@ impl ConfigEditor {
                 &self.dir,
                 format!("默认：{}", self.default_dir),
             ),
-            ("程序参数", &self.args, String::new()),
-            ("构建参数", &self.build_flags, "传给 go build".to_string()),
+            ("程序参数", &self.args, "启动程序时传入，如 server -c config/settings.yml".to_string()),
+            ("构建参数", &self.build_flags, "go build 的选项，如 -race、-tags dev".to_string()),
             ("输出文件", &self.output, "默认：临时目录".to_string()),
         ]
     }
@@ -300,6 +302,14 @@ impl Workspace {
             self.open_run_configs(true, window, cx);
             return;
         };
+        if let Err(reason) = run::check_build_flags(&config.build_flags) {
+            self.open_run_configs(false, window, cx);
+            if let Some(editor) = &mut self.run.editor {
+                editor.error = Some(reason.into());
+            }
+            cx.notify();
+            return;
+        }
         self.stop_run(cx);
         // The build reads files from disk, not from the editor.
         self.save_all(cx);
@@ -468,6 +478,7 @@ impl Workspace {
             focus: cx.focus_handle(),
             root: self.root.clone(),
             default_dir: SharedString::default(),
+            error: None,
             _package_changed: None,
         };
         // The default folder follows the package as it is typed.
@@ -545,6 +556,21 @@ impl Workspace {
             return;
         };
         editor.store(cx);
+        // A configuration that would not build is shown with what is wrong.
+        if let Some((ix, reason)) = editor
+            .configs
+            .iter()
+            .enumerate()
+            .find_map(|(ix, config)| run::check_build_flags(&config.build_flags).err().map(|reason| (ix, reason)))
+        {
+            if ix != editor.selected {
+                editor.load(ix, window, cx);
+            }
+            editor.error = Some(reason.into());
+            self.run.editor = Some(editor);
+            cx.notify();
+            return;
+        }
         for (ix, config) in editor.configs.iter_mut().enumerate() {
             if config.name.is_empty() {
                 config.name = format!("配置 {}", ix + 1);
@@ -904,6 +930,18 @@ impl Workspace {
                     .justify_end()
                     .border_t_1()
                     .border_color(theme.border)
+                    .when_some(editor.error.clone(), |footer, error| {
+                        footer.child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1p5()
+                                .text_size(UI_SMALL)
+                                .text_color(theme.danger)
+                                .child(icon("circle-alert").xsmall())
+                                .child(div().min_w_0().child(error)),
+                        )
+                    })
                     .child(
                         Button::new("run-config-cancel")
                             .small()

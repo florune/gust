@@ -26,11 +26,13 @@ use gpui_kit::*;
 use crate::proc;
 use crate::run;
 
-/// Keys the workspace binds that a shell needs for itself while it has focus.
+/// Keys the window binds that a shell needs for itself while it has focus:
+/// among them Tab, which would otherwise move the focus to the next control
+/// instead of completing a name.
 pub fn init(cx: &mut App) {
     let terminal = Some("Terminal");
     cx.bind_keys(
-        ["ctrl-s", "ctrl-w", "ctrl-o", "ctrl-p", "ctrl-f", "ctrl-k"]
+        ["ctrl-s", "ctrl-w", "ctrl-o", "ctrl-p", "ctrl-f", "ctrl-k", "tab", "shift-tab"]
             .map(|key| KeyBinding::new(key, NoAction, terminal)),
     );
 }
@@ -268,6 +270,11 @@ impl TerminalView {
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         self.focus.focus(window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
     }
 
     fn on_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {

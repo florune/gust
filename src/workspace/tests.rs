@@ -397,6 +397,18 @@ fn the_terminal_keeps_its_keys_from_the_editor(cx: &mut TestAppContext) {
     fixture.press("ctrl-w", cx);
     assert_eq!(state(cx), (true, 1, 1));
 
+    // Tab completes a name in the shell rather than moving the focus away.
+    let focused = |cx: &mut TestAppContext| {
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            fixture.workspace.read(cx).terminals[0].view.read(cx).is_focused(window)
+        })
+        .unwrap()
+    };
+    assert!(focused(cx));
+    fixture.press("tab", cx);
+    fixture.press("shift-tab", cx);
+    assert!(focused(cx));
+
     fixture.press("ctrl-`", cx);
     assert_eq!(state(cx), (false, 1, 1));
     // Back in the editor, the same key closes the tab again.
@@ -2632,4 +2644,27 @@ fn files_compare_across_worktrees_and_new_ones_get_their_own_settings(cx: &mut T
     });
     assert_eq!(marker, green);
     let _ = std::fs::remove_dir_all(&beside);
+}
+
+#[gpui_kit::test]
+fn program_arguments_in_the_build_options_are_caught_before_building(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "build-flags", &[GO_MOD, ("main.go", "package main\n\nfunc main() {}\n")], "main.go");
+    fixture.update(cx, |workspace, _, _| {
+        workspace.settings.runs = vec![crate::run::RunConfig {
+            build_flags: "server -c config/settings.test.yml".into(),
+            ..Default::default()
+        }];
+    });
+    fixture.update(cx, |workspace, window, cx| workspace.start_run(false, window, cx));
+    let (error, console) = fixture.workspace.read_with(cx, |workspace, _| {
+        let error = workspace.run.editor.as_ref().and_then(|editor| editor.error.clone());
+        (error, workspace.run.console.is_some())
+    });
+    let error = error.expect("the configuration opens with what is wrong");
+    assert!(error.contains("「server」") && error.contains("程序参数"), "{error}");
+    assert!(!console, "nothing is built");
+
+    // Saving it as it is does not go through either.
+    fixture.update(cx, |workspace, window, cx| workspace.apply_run_configs(false, window, cx));
+    assert!(fixture.workspace.read_with(cx, |workspace, _| workspace.run.editor.is_some()));
 }

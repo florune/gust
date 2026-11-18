@@ -122,6 +122,35 @@ pub fn split_args(line: &str) -> Vec<String> {
     words
 }
 
+/// Options of `go build` written with their value as the next word, `-tags dev`.
+const BUILD_FLAGS_WITH_VALUE: &[&str] = &[
+    "C", "p", "o", "asmflags", "buildmode", "compiler", "gccgoflags", "gcflags", "installsuffix",
+    "ldflags", "mod", "modfile", "overlay", "pgo", "pkgdir", "tags", "toolexec", "covermode",
+    "coverpkg", "exec",
+];
+
+/// Whether `flags` are options of `go build` and nothing else. Anything that
+/// is not would be taken for a package to build, which fails in ways that
+/// do not say why; this says what is wrong instead.
+pub fn check_build_flags(flags: &str) -> Result<(), String> {
+    let words = split_args(flags);
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        let Some(option) = word.strip_prefix("--").or_else(|| word.strip_prefix('-')) else {
+            return Err(format!(
+                "构建参数中的「{word}」不是 go build 的选项。要在启动时传给程序的参数，请填写在「程序参数」中。"
+            ));
+        };
+        if option == "o" {
+            return Err("构建参数不能包含 -o：可执行文件的位置请填写在「输出文件」中。".to_string());
+        }
+        if !option.contains('=') && BUILD_FLAGS_WITH_VALUE.contains(&option) && words.next().is_none() {
+            return Err(format!("构建参数中的 -{option} 缺少取值。"));
+        }
+    }
+    Ok(())
+}
+
 /// `env` with the variables of `overrides` in place of its own of the same
 /// names; both are `KEY=VALUE` lines.
 pub fn override_env(env: &str, overrides: &str) -> String {
@@ -433,6 +462,16 @@ mod tests {
             ["-name", "my app", "-dir", r"C:\some dir", "-q", r#"a "b""#]
         );
         assert_eq!(split_args(r#"-empty "" x"#), ["-empty", "", "x"]);
+    }
+
+    #[test]
+    fn build_flags_are_options_of_go_build_only() {
+        assert!(check_build_flags("").is_ok());
+        assert!(check_build_flags("-race -tags dev -ldflags \"-s -w\" -gcflags=all=-N").is_ok());
+        let wrong = check_build_flags("server -c config/settings.test.yml").unwrap_err();
+        assert!(wrong.contains("「server」") && wrong.contains("程序参数"));
+        assert!(check_build_flags("-o out.exe").unwrap_err().contains("输出文件"));
+        assert!(check_build_flags("-race -tags").unwrap_err().contains("-tags"));
     }
 
     #[test]
