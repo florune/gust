@@ -241,6 +241,8 @@ pub struct Workspace {
     /// The tab last scrolled into view, so it is done once per change of tab.
     tab_in_view: std::cell::Cell<Option<usize>>,
     tab_bar_width: std::cell::Cell<Pixels>,
+    /// The title last given to the window.
+    shown_title: std::cell::RefCell<String>,
     /// The repository's worktrees, and the box that adds one.
     worktrees: worktrees_view::Worktrees,
     /// The shortcuts page, while it is open.
@@ -399,6 +401,7 @@ impl Workspace {
             tab_scroll: ScrollHandle::new(),
             tab_in_view: std::cell::Cell::new(None),
             tab_bar_width: std::cell::Cell::new(px(0.)),
+            shown_title: std::cell::RefCell::new(String::new()),
             lens_generation: 0,
             about: None,
             zoom_remainder: 0.,

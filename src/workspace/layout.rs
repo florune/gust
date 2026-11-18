@@ -803,8 +803,9 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_lenses(cx);
+        self.update_window_title(window);
         let palette = self.render_palette(cx);
         let run_configs = self.render_run_configs(cx);
         let file_prompt = self.render_file_prompt(cx);

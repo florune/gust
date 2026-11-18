@@ -2668,3 +2668,16 @@ fn program_arguments_in_the_build_options_are_caught_before_building(cx: &mut Te
     fixture.update(cx, |workspace, window, cx| workspace.apply_run_configs(false, window, cx));
     assert!(fixture.workspace.read_with(cx, |workspace, _| workspace.run.editor.is_some()));
 }
+
+#[gpui_kit::test]
+fn the_window_is_named_after_its_project_and_file(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, "title", &[GO_MOD, ("main.go", "package main\n"), ("notes.md", "one\n")], "main.go");
+    let title = |cx: &mut TestAppContext| fixture.workspace.read_with(cx, |workspace, _| workspace.window_title());
+    let project = fixture.root.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(title(cx), format!("{project} – main.go"));
+    fixture.open_file("notes.md", cx);
+    assert_eq!(title(cx), format!("{project} – notes.md"));
+    fixture.press("ctrl-f4", cx);
+    fixture.press("ctrl-f4", cx);
+    assert_eq!(title(cx), project);
+}

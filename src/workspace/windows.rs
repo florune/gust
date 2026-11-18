@@ -52,6 +52,30 @@ pub(super) struct ProjectChoice {
 }
 
 impl Workspace {
+    /// What the window is called where the system shows it: the taskbar, its
+    /// previews, Alt+Tab. The project first, then the file in front.
+    pub(super) fn window_title(&self) -> String {
+        let project = self.project_name();
+        let file = if self.diff_active {
+            self.diff.as_ref().map(|diff| diff.title.to_string())
+        } else {
+            self.active.and_then(|ix| self.docs.get(ix)).map(|doc| doc.title.to_string())
+        };
+        match file {
+            Some(file) if !file.is_empty() => format!("{project} – {file}"),
+            _ => project.to_string(),
+        }
+    }
+
+    /// Give the window its title again when what it shows has changed.
+    pub(super) fn update_window_title(&self, window: &mut Window) {
+        let title = self.window_title();
+        if *self.shown_title.borrow() != title {
+            window.set_window_title(&title);
+            *self.shown_title.borrow_mut() = title;
+        }
+    }
+
     /// Open the project at `root`, asking first whether here or in a new window.
     pub(super) fn choose_project(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if root == self.root {
